@@ -3,8 +3,6 @@ package checkout
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,181 +10,67 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
-	"xgift/internal/proxy"
+
+	"xgift/internal/accounts"
 	"xgift/internal/vault"
 )
 
+// stripeClient performs read-only Stripe requests through the same proxy as
+// the X account that created the session. There is deliberately no card
+// tokenization or payment confirmation in this package.
 type stripeClient struct {
-	http       *http.Client
-	key        string
-	vault      *vault.Vault
-	closeRoute func()
-	route      *paymentRoute
-	card       card
-	hasCard    bool
-	openRoute  func(context.Context, json.RawMessage) (*http.Client, func(), error)
+	http  *http.Client
+	key   string
+	vault *vault.Vault
 }
 
-// paymentMode separates read-only Stripe traffic from payment submissions so a
-// card+node pair is consumed exactly when a card is about to be tokenized.
-type paymentMode int
-
-const (
-	paymentRead paymentMode = iota
-	paymentPay
-	paymentRetry
-)
-
 type stripeError struct {
-	Code, Type                            string
-	Message, Param, RequestID             string
-	DeclineCode, AdviceCode               string
-	NetworkDeclineCode, NetworkAdviceCode string
-	HTTP                                  int
-	Replayed                              bool
+	Code, Type                string
+	Message, Param, RequestID string
+	HTTP                      int
 }
 
 func (e *stripeError) Error() string {
-	return fmt.Sprintf("Stripe rejected the request (HTTP %d, type=%s, code=%s, decline=%s, advice=%s, network_decline=%s, network_advice=%s, param=%s, request=%s): %s", e.HTTP, e.Type, e.Code, e.DeclineCode, e.AdviceCode, e.NetworkDeclineCode, e.NetworkAdviceCode, e.Param, e.RequestID, e.Message)
+	return fmt.Sprintf("Stripe rejected the request (HTTP %d, type=%s, code=%s, param=%s, request=%s): %s", e.HTTP, e.Type, e.Code, e.Param, e.RequestID, e.Message)
 }
-
-// Keep only the fields needed to diagnose and verify this payment. Never retain
-// arbitrary error payloads containing payment-method or billing details.
-type stripeIntentEvidence struct {
-	ID, Status, Currency string
-	ClientSecret         string `json:"client_secret"`
-	Live                 bool   `json:"livemode"`
-	Amount               int
-	Received             *int `json:"amount_received"`
-	Capturable           *int `json:"amount_capturable"`
-}
-type stripeAPIError struct {
-	Type, Code, Message, Param string
-	DeclineCode                string                `json:"decline_code"`
-	AdviceCode                 string                `json:"advice_code"`
-	NetworkDeclineCode         string                `json:"network_decline_code"`
-	NetworkAdviceCode          string                `json:"network_advice_code"`
-	Intent                     *stripeIntentEvidence `json:"payment_intent"`
-}
-
-func newStripe(ctx context.Context, v *vault.Vault, recipient string, mode paymentMode) (*stripeClient, error) {
-	key, e := v.Get("stripe-key")
-	if e != nil {
-		return nil, e
-	}
-	defer clear(key)
-	if !regexp.MustCompile(`^pk_live_[A-Za-z0-9]+$`).Match(key) {
-		return nil, errors.New("invalid Stripe merchant publishable key")
-	}
-	var route *paymentRoute
-	var bound card
-	last4, _ := ctx.Value(paymentCardSelectionKey{}).(string)
-	switch mode {
-	case paymentPay:
-		if route, bound, e = assignPaymentRouteCard(v, recipient, false, last4); e != nil {
-			return nil, e
-		}
-	case paymentRetry:
-		if route, bound, e = assignPaymentRouteCard(v, recipient, true, last4); e != nil {
-			return nil, e
-		}
-	default:
-		if route, e = selectPaymentRoute(v, recipient); e != nil {
-			return nil, e
-		}
-	}
-	// Missing/empty pool is direct; an assigned order never silently falls back.
-	client := &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 35 * time.Second}
-	closeRoute := func() { client.CloseIdleConnections() }
-	if route != nil {
-		client, closeRoute, e = proxy.OpenOutbound(ctx, route.Outbound)
-		if e != nil {
-			clear(route.Outbound)
-			return nil, e
-		}
-	}
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return errStripeRedirect }
-	s := &stripeClient{http: client, key: string(key), vault: v, closeRoute: closeRoute, route: route, openRoute: proxy.OpenOutbound}
-	if mode != paymentRead {
-		s.card, s.hasCard = bound, true
-	}
-	return s, nil
-}
-
-// paymentCard returns the card bound to this payment attempt. Legacy callers
-// and fixtures fall back to the first configured card.
-func (s *stripeClient) paymentCard() (card, error) {
-	if s.hasCard {
-		return s.card, nil
-	}
-	return readCard(s.vault)
-}
-func (s *stripeClient) close() {
-	if s.closeRoute != nil {
-		close := s.closeRoute
-		s.closeRoute = nil
-		close()
-	} else {
-		s.http.CloseIdleConnections()
-	}
-	if s.route != nil {
-		clear(s.route.Outbound)
-		s.route = nil
-	}
-}
-
-type stripeTransportFailure struct{}
 
 var errStripeRedirect = errors.New("unexpected Stripe API redirect")
+
+type stripeTransportFailure struct{}
 
 func (*stripeTransportFailure) Error() string {
 	return "Stripe transport failed; request outcome may be unknown"
 }
 
-func safeStripeNetworkRetry(method, path string) bool {
-	if method == http.MethodGet {
-		return true
+func newStripe(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, account accounts.Account) (*stripeClient, error) {
+	key, err := v.Get("stripe-key")
+	if err != nil {
+		return nil, errors.New("Stripe publishable key is missing; store it with setup or put --name stripe-key")
 	}
-	parts := strings.Split(path, "/")
-	return method == http.MethodPost && len(parts) == 3 && parts[0] == "payment_pages" && sessionPattern.MatchString(parts[1]) && parts[2] == "init"
-}
-func (s *stripeClient) call(ctx context.Context, method, path string, form url.Values, idempotency string, out any) error {
-	for attempt := 0; attempt < 3; attempt++ {
-		err := s.callOnce(ctx, method, path, form, idempotency, out)
-		var failure *stripeTransportFailure
-		if !errors.As(err, &failure) || s.route == nil || ctx.Err() != nil {
-			return err
-		}
-		if e := coolPaymentNode(s.vault, s.route.Outbound); e != nil {
-			return errors.New("network failure; could not persist payment node cooldown")
-		}
-		// A failed confirmation/tokenization is never replayed on another exit.
-		if !safeStripeNetworkRetry(method, path) || attempt == 2 {
-			return err
-		}
-		next, e := rotateCoolingRoute(s.vault, s.route)
-		if e != nil {
-			return e
-		}
-		s.close()
-		s.route = next
-		client, close, e := s.openRoute(ctx, next.Outbound)
-		if e != nil {
-			return e
-		}
-		client.CheckRedirect = func(*http.Request, []*http.Request) error { return errStripeRedirect }
-		s.http, s.closeRoute = client, close
+	defer clear(key)
+	if !ValidStripeKey(string(key)) {
+		return nil, errors.New("invalid Stripe merchant publishable key")
 	}
-	return errors.New("Stripe network retry limit reached")
+	base, err := mgr.Client(account)
+	if err != nil {
+		return nil, err
+	}
+	client := *base
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return errStripeRedirect }
+	return &stripeClient{http: &client, key: string(key), vault: v}, nil
 }
-func (s *stripeClient) callOnce(ctx context.Context, method, path string, form url.Values, idempotency string, out any) error {
+
+func (s *stripeClient) close() {
+	s.http.CloseIdleConnections()
+}
+
+func (s *stripeClient) call(ctx context.Context, method, path string, form url.Values, out any) error {
 	form.Set("key", s.key)
 	target := "https://api.stripe.com/v1/" + path
 	var input io.Reader
-	if method == "GET" {
+	if method == http.MethodGet {
 		target += "?" + form.Encode()
 	} else {
 		input = strings.NewReader(form.Encode())
@@ -196,9 +80,6 @@ func (s *stripeClient) callOnce(ctx context.Context, method, path string, form u
 		return e
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if idempotency != "" {
-		req.Header.Set("Idempotency-Key", idempotency)
-	}
 	res, e := s.http.Do(req)
 	if e != nil {
 		if errors.Is(e, errStripeRedirect) {
@@ -223,15 +104,6 @@ func (s *stripeClient) callOnce(ctx context.Context, method, path string, form u
 	}
 	if envelope.Error != nil {
 		msg := envelope.Error.Message
-		for name, values := range form {
-			if strings.Contains(name, "card[") || strings.Contains(name, "billing_details") || name == "key" {
-				for _, value := range values {
-					if value != "" {
-						msg = strings.ReplaceAll(msg, value, "[redacted]")
-					}
-				}
-			}
-		}
 		msg = regexp.MustCompile(`[0-9]{12,19}|(?:cs_live_|pm_|pi_|pk_live_|sk_live_)[A-Za-z0-9_]+`).ReplaceAllString(msg, "[redacted]")
 		msg = strings.Map(func(r rune) rune {
 			if r < 32 || r == 127 {
@@ -242,7 +114,7 @@ func (s *stripeClient) callOnce(ctx context.Context, method, path string, form u
 		if len(msg) > 600 {
 			msg = msg[:600]
 		}
-		se := &stripeError{Code: safeErrorField(envelope.Error.Code), Type: safeErrorField(envelope.Error.Type), HTTP: res.StatusCode, Message: msg, Param: safeErrorField(envelope.Error.Param), RequestID: safeErrorField(res.Header.Get("Request-Id")), Replayed: res.Header.Get("Idempotent-Replayed") == "true", DeclineCode: safeErrorField(envelope.Error.DeclineCode), AdviceCode: safeErrorField(envelope.Error.AdviceCode), NetworkDeclineCode: safeErrorField(envelope.Error.NetworkDeclineCode), NetworkAdviceCode: safeErrorField(envelope.Error.NetworkAdviceCode)}
+		se := &stripeError{Code: safeErrorField(envelope.Error.Code), Type: safeErrorField(envelope.Error.Type), HTTP: res.StatusCode, Message: msg, Param: safeErrorField(envelope.Error.Param), RequestID: safeErrorField(res.Header.Get("Request-Id"))}
 		diagnostic, _ := json.Marshal(map[string]any{"http_status": res.StatusCode, "path": path, "error": se, "observed_at": time.Now().Unix()})
 		defer clear(diagnostic)
 		if err := s.vault.Put("stripe-error:last", diagnostic); err != nil {
@@ -253,13 +125,6 @@ func (s *stripeClient) callOnce(ctx context.Context, method, path string, form u
 			if err := s.vault.Put("stripe-error:"+parts[1], diagnostic); err != nil {
 				return errors.New("could not persist order payment error")
 			}
-			if intent := envelope.Error.Intent; intent != nil && regexp.MustCompile(`^pi_[A-Za-z0-9]+$`).MatchString(intent.ID) && strings.HasPrefix(intent.ClientSecret, intent.ID+"_secret_") {
-				evidence, _ := json.Marshal(intent)
-				defer clear(evidence)
-				if err := s.vault.Put("stripe-intent-evidence:"+parts[1], evidence); err != nil {
-					return errors.New("could not persist payment intent evidence")
-				}
-			}
 		}
 		return httpFailure(se, res.StatusCode, res.Header.Get("Retry-After"))
 	}
@@ -267,6 +132,12 @@ func (s *stripeClient) callOnce(ctx context.Context, method, path string, form u
 		return httpFailure(&stripeError{HTTP: res.StatusCode}, res.StatusCode, res.Header.Get("Retry-After"))
 	}
 	return json.Unmarshal(raw, out)
+}
+
+// stripeAPIError retains only the fields needed to diagnose a read-only
+// session lookup. Payment-method and customer details are never stored.
+type stripeAPIError struct {
+	Type, Code, Message, Param string
 }
 
 type paymentPage struct {
@@ -330,7 +201,11 @@ func (p *paymentPage) UnmarshalJSON(b []byte) error {
 	p.IntentNull = ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 	return nil
 }
+
 func nullJSON(v json.RawMessage) bool { return len(v) == 0 || string(v) == "null" }
+
+// guard verifies the Stripe session is the exact catalog product for the
+// recorded recipient. It never submits a payment.
 func (p *paymentPage) guard(r *Record, plan Plan, before bool) error {
 	if p.SessionID != r.SessionID || p.Account.ID != plan.Merchant || !p.Live || p.Mode != "payment" || p.Currency != plan.Currency || p.Group.Currency != plan.Currency || p.SuccessURL != "https://x.com/"+r.Username+"/gift-premium/success" || p.CancelURL != "https://x.com/"+r.Username+"/gift-premium" {
 		return errors.New("Stripe merchant, session, recipient return URLs, currency or payment mode mismatch")
@@ -349,113 +224,33 @@ func (p *paymentPage) guard(r *Record, plan Plan, before bool) error {
 		if p.Intent.Currency != plan.Currency || p.Intent.Amount != plan.Minor {
 			return errors.New("Stripe payment intent amount or currency mismatch")
 		}
-		if before {
-			return errors.New("an existing payment intent requires inspection before another submission")
-		}
 		if p.PaymentStatus == "paid" && (p.Intent.Status != "succeeded" || (p.Intent.AmountReceived == nil || *p.Intent.AmountReceived != plan.Minor)) {
 			return errors.New("Stripe payment intent does not confirm the exact received amount")
 		}
 	}
 	if before && (!p.IntentPresent || !p.IntentNull) {
-		return errors.New("Stripe must explicitly return a null payment intent before submitting")
+		return errors.New("Stripe must explicitly return a null payment intent before publishing a link")
 	}
 	if before && (p.Status != "open" || p.PaymentStatus != "unpaid" || p.Total.Due != plan.Minor || p.Group.Due != plan.Minor || p.Checksum == "") {
 		return errors.New("Stripe checkout is not open and unpaid at the exact authorized amount")
 	}
 	return nil
 }
+
+// page reads a session. init=true performs the same read call the checkout
+// page performs; init=false is used once a session completed.
 func (s *stripeClient) page(ctx context.Context, r *Record, init bool) (*paymentPage, error) {
-	method, path := "GET", "payment_pages/"+r.SessionID
+	method, path := http.MethodGet, "payment_pages/"+r.SessionID
 	form := url.Values{}
 	if init {
-		method = "POST"
+		method = http.MethodPost
 		path += "/init"
 		form.Set("browser_locale", "en")
 		form.Set("redirect_type", "url")
 	}
 	var page paymentPage
-	e := retrySafe(ctx, func() error { return s.call(ctx, method, path, form, "", &page) })
+	e := retrySafe(ctx, func() error { return s.call(ctx, method, path, form, &page) })
 	return &page, e
-}
-
-type card struct {
-	Number  string `json:"number"`
-	Month   string `json:"exp_month"`
-	Year    string `json:"exp_year"`
-	CVC     string `json:"cvc"`
-	Name    string `json:"billing_name"`
-	Email   string `json:"email"`
-	Country string `json:"billing_country"`
-	Postal  string `json:"billing_postal_code"`
-	Line1   string `json:"billing_address_line1"`
-	Line2   string `json:"billing_address_line2"`
-	City    string `json:"billing_city"`
-	State   string `json:"billing_state"`
-}
-
-func CheckPaymentConfiguration(v *vault.Vault) error {
-	cards, err := readCards(v)
-	if err != nil {
-		return err
-	}
-	if len(usableCards(cards)) == 0 {
-		return ErrNoUsableCard
-	}
-	return nil
-}
-func (s *stripeClient) tokenize(ctx context.Context, r *Record, c card) (string, error) {
-	form := url.Values{"type": {"card"}, "card[number]": {c.Number}, "card[exp_month]": {c.Month}, "card[exp_year]": {c.Year}, "card[cvc]": {c.CVC}, "billing_details[name]": {c.Name}, "billing_details[email]": {c.Email}}
-	if c.Country != "" {
-		form.Set("billing_details[address][country]", c.Country)
-	}
-	if c.Postal != "" {
-		form.Set("billing_details[address][postal_code]", c.Postal)
-	}
-	for name, value := range map[string]string{"line1": c.Line1, "line2": c.Line2, "city": c.City, "state": c.State} {
-		if value != "" {
-			form.Set("billing_details[address]["+name+"]", value)
-		}
-	}
-	var pm struct {
-		ID, Type string
-		Live     bool `json:"livemode"`
-	}
-	e := retrySafe(ctx, func() error { return s.call(ctx, "POST", "payment_methods", form, idempotency(r, "method"), &pm) })
-	if e != nil {
-		return "", e
-	}
-	if !pm.Live || pm.Type != "card" || !regexp.MustCompile(`^pm_[A-Za-z0-9]+$`).MatchString(pm.ID) {
-		return "", errors.New("invalid Stripe card token")
-	}
-	return pm.ID, nil
-}
-func idempotency(r *Record, operation string) string {
-	if r.ManualRecovery {
-		operation += fmt.Sprintf(":manual:%d", r.RecoveryAttempts)
-	}
-	sum := sha256.Sum256([]byte("xgift-v1:" + operation + ":" + r.SessionID + ":" + r.RecipientID + ":" + strconv.Itoa(r.Months)))
-	return "xgift-" + hex.EncodeToString(sum[:])
-}
-func confirmationForm(r *Record, p *paymentPage, method string, plan Plan) url.Values {
-	return url.Values{"payment_method": {method}, "expected_amount": {strconv.Itoa(plan.Minor)}, "expected_payment_method_type": {"card"}, "init_checksum": {p.Checksum}, "return_url": {"https://x.com/" + r.Username + "/gift-premium/success"}}
-}
-func (s *stripeClient) confirm(ctx context.Context, r *Record) (*paymentPage, error) {
-	form, e := url.ParseQuery(r.ConfirmParameters)
-	if e != nil {
-		return nil, e
-	}
-	var raw json.RawMessage
-	e = s.call(ctx, "POST", "payment_pages/"+r.SessionID+"/confirm", form, r.ConfirmKey, &raw)
-	defer clear(raw)
-	if e != nil {
-		return nil, e
-	}
-	if e = s.vault.Put("stripe-confirm:"+r.SessionID, raw); e != nil {
-		return nil, e
-	}
-	var result paymentPage
-	e = json.Unmarshal(raw, &result)
-	return &result, e
 }
 
 func safeErrorField(s string) string {

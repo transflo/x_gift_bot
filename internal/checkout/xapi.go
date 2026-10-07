@@ -9,8 +9,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
+
+	"xgift/internal/accounts"
 	"xgift/internal/vault"
 )
 
@@ -25,9 +28,18 @@ var ErrNotEligible = errors.New("recipient cannot receive Premium gifts")
 var ErrUserNotFound = errors.New("recipient was not found")
 var ErrXReadFailure = errors.New("X account or price query failed")
 
-// Eligibility is read-only: it neither creates a checkout nor submits a payment.
-func Eligibility(ctx context.Context, v *vault.Vault, user string, port int) (string, error) {
-	c, err := newXClient(v, port)
+// Eligibility is read-only: it neither creates a checkout nor publishes a
+// link. Any enabled account may serve the check.
+func Eligibility(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, user string) (string, error) {
+	list, err := accounts.Load(v)
+	if err != nil {
+		return "", err
+	}
+	enabled := accounts.Enabled(list)
+	if len(enabled) == 0 {
+		return "", errors.New("no enabled X account is configured")
+	}
+	c, err := newXClient(ctx, v, mgr, enabled[0])
 	if err != nil {
 		return "", err
 	}
@@ -38,17 +50,16 @@ func Eligibility(ctx context.Context, v *vault.Vault, user string, port int) (st
 func (p Plan) Name() string { return fmt.Sprintf("Premium Gift - %d months", p.Months) }
 
 type xClient struct {
-	// Set only after validating an explicitly replaced public order.
+	// Set only after validating an explicitly replaced checkout.
 	publicReplacement string
+	account           accounts.Account
+	mgr               *accounts.Manager
 	vault             *vault.Vault
 	http              *http.Client
-	regionalHTTP      *http.Client
 	headers           http.Header
-	readCheckout      func(context.Context, *Record) (*paymentPage, error)
-	readCheckoutPaid  func(context.Context, *Record, Plan) (bool, error)
 }
 
-func newXClient(v *vault.Vault, port int) (*xClient, error) {
+func newXClient(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, account accounts.Account) (*xClient, error) {
 	raw, e := v.Get("api-auth")
 	if e != nil {
 		return nil, errors.New("X API authentication metadata is missing or unreadable")
@@ -58,85 +69,58 @@ func newXClient(v *vault.Vault, port int) (*xClient, error) {
 	if json.Unmarshal(raw, &auth) != nil || !strings.HasPrefix(auth.Authorization, "Bearer ") {
 		return nil, errors.New("invalid X API authentication metadata")
 	}
-	raw, e = v.Get("cookies")
-	if e != nil {
-		return nil, e
-	}
-	defer clear(raw)
-	var state struct {
-		Cookies []struct{ Name, Value, Domain string }
-	}
-	if e = json.Unmarshal(raw, &state); e != nil {
-		return nil, e
+	if err := account.Validate(); err != nil {
+		return nil, err
 	}
 	h := http.Header{"Authorization": {auth.Authorization}, "User-Agent": {auth.UserAgent}, "Content-Type": {"application/json"}, "Origin": {"https://x.com"}, "X-Twitter-Auth-Type": {"OAuth2Session"}, "X-Twitter-Active-User": {"yes"}, "X-Twitter-Client-Language": {"en"}}
-	found := map[string]bool{}
-	for _, c := range state.Cookies {
-		if c.Domain != ".x.com" && c.Domain != "x.com" {
-			return nil, errors.New("unexpected cookie domain")
-		}
-		if c.Name != "auth_token" && c.Name != "ct0" {
-			return nil, errors.New("unexpected cookie name")
-		}
-		if found[c.Name] || c.Value == "" || strings.ContainsAny(c.Value, "\r\n;") {
-			return nil, errors.New("invalid X cookie")
-		}
-		found[c.Name] = true
-		h.Add("Cookie", c.Name+"="+c.Value)
-		if c.Name == "ct0" {
-			h.Set("X-Csrf-Token", c.Value)
-		}
+	h.Add("Cookie", "auth_token="+account.AuthToken)
+	h.Add("Cookie", "ct0="+account.CT0)
+	h.Set("X-Csrf-Token", account.CT0)
+	base, err := mgr.Client(account)
+	if err != nil {
+		return nil, err
 	}
-	if !found["ct0"] || !found["auth_token"] {
-		return nil, errors.New("required X cookies missing")
-	}
-	// Account checks connect directly. Regional pricing and checkout creation
-	// must share the configured exit because X prices depend on its country.
-	newClient := func(proxy func(*http.Request) (*url.URL, error)) *http.Client {
-		return &http.Client{Transport: &http.Transport{Proxy: proxy, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("unexpected X API redirect") }}
-	}
-	p, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
-	return &xClient{http: newClient(nil), regionalHTTP: newClient(http.ProxyURL(p)), headers: h, vault: v}, nil
+	client := *base
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return errors.New("unexpected X API redirect") }
+	return &xClient{account: account, mgr: mgr, http: &client, headers: h, vault: v}, nil
 }
-func (c *xClient) close() {
-	c.http.CloseIdleConnections()
-	if c.regionalHTTP != nil {
-		c.regionalHTTP.CloseIdleConnections()
-	}
+
+func (c *xClient) stripe(ctx context.Context) (*stripeClient, error) {
+	return newStripe(ctx, c.vault, c.mgr, c.account)
 }
+
+func (c *xClient) close() { c.http.CloseIdleConnections() }
+
 func (c *xClient) call(ctx context.Context, user, name, id string, variables any, mutation bool, out any) error {
 	if mutation {
 		return c.callOnce(ctx, user, name, id, variables, true, out)
 	}
 	return retrySafe(ctx, func() error { return c.callOnce(ctx, user, name, id, variables, false, out) })
 }
+
 func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables any, mutation bool, out any) (callErr error) {
-	// A fixed-operation audit is encrypted before sending, then completed even on
-	// transport/body failures. Never store request headers or cookies here.
+	// A fixed-operation audit is encrypted before a mutation is sent, then
+	// completed even on transport/body failures. Headers and cookies are never
+	// stored here.
 	var audit struct {
-		Operation   string `json:"operation"`
-		Variables   any    `json:"variables"`
-		StartedAt   int64  `json:"started_at"`
-		FinishedAt  int64  `json:"finished_at,omitempty"`
-		Phase       string `json:"phase"`
-		HTTP        int    `json:"http_status,omitempty"`
-		Body        string `json:"body,omitempty"`
-		Cause       string `json:"cause,omitempty"`
-		Failure     string `json:"failure,omitempty"`
-		ContentType string `json:"content_type,omitempty"`
-		RequestID   string `json:"request_id,omitempty"`
-		EdgeID      string `json:"edge_id,omitempty"`
+		AccountID  string `json:"account_id"`
+		Operation  string `json:"operation"`
+		Variables  any    `json:"variables"`
+		StartedAt  int64  `json:"started_at"`
+		FinishedAt int64  `json:"finished_at,omitempty"`
+		Phase      string `json:"phase"`
+		HTTP       int    `json:"http_status,omitempty"`
+		Cause      string `json:"cause,omitempty"`
+		Failure    string `json:"failure,omitempty"`
+		RequestID  string `json:"request_id,omitempty"`
 	}
-	audit.Operation, audit.Variables, audit.StartedAt, audit.Phase = name, variables, time.Now().Unix(), "request_pending"
+	audit.AccountID, audit.Operation, audit.Variables, audit.StartedAt, audit.Phase = c.account.ID, name, variables, time.Now().Unix(), "request_pending"
 	if !mutation {
 		defer func() {
 			if callErr == nil {
 				return
 			}
 			audit.FinishedAt, audit.Failure = time.Now().Unix(), callErr.Error()
-			if len(audit.Body) > 32<<10 {
-				audit.Body = audit.Body[:32<<10]
-			}
 			b, err := json.Marshal(audit)
 			defer clear(b)
 			if err != nil || c.vault.Put(fmt.Sprintf("x-read-failure:%s:%s:%d", user, name, time.Now().UnixNano()), b) != nil {
@@ -170,10 +154,10 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 		}()
 	}
 	target := "https://x.com/i/api/graphql/" + id + "/" + name
-	method := "GET"
+	method := http.MethodGet
 	var body []byte
 	if mutation {
-		method = "POST"
+		method = http.MethodPost
 		body, _ = json.Marshal(map[string]any{"variables": variables, "queryId": id})
 	} else {
 		b, _ := json.Marshal(variables)
@@ -189,29 +173,20 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 	}
 	req.Header = c.headers.Clone()
 	req.Header.Set("Referer", "https://x.com/"+user+"/gift-premium")
-	client := c.http
-	if mutation || name == "useSubscriptionProductDetailsByRestIdQuery" {
-		if c.regionalHTTP == nil {
-			return errors.New("X regional checkout proxy is unavailable")
-		}
-		client = c.regionalHTTP
-	}
-	res, e := client.Do(req)
+	res, e := c.http.Do(req)
 	if e != nil {
 		audit.Phase, audit.Cause = "transport_failed", e.Error()
-		return temporary(fmt.Errorf("X %s request failed", name))
+		return temporary(&transportFailure{cause: fmt.Errorf("X %s request failed", name)})
 	}
 	audit.HTTP, audit.Phase = res.StatusCode, "response_received"
-	audit.ContentType, audit.RequestID, audit.EdgeID = res.Header.Get("Content-Type"), res.Header.Get("X-Request-ID"), res.Header.Get("CF-Ray")
+	audit.RequestID = res.Header.Get("X-Request-ID")
 	defer res.Body.Close()
 	raw, e := io.ReadAll(io.LimitReader(res.Body, (2<<20)+1))
 	defer clear(raw)
 	if len(raw) > 2<<20 {
-		audit.Body = string(raw[:2<<20])
 		audit.Phase = "response_too_large"
 		return errors.New("X response exceeded size limit")
 	}
-	audit.Body = string(raw)
 	if e != nil {
 		audit.Phase, audit.Cause = "response_read_failed", e.Error()
 		if res.StatusCode >= 400 && res.StatusCode < 500 {
@@ -241,17 +216,19 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 
 // A 403 on a read-only X query can be transient. Retry within the existing
 // bounded budget and Retry-After rules, without changing credentials or proxy.
-// Never apply this exception to checkout creation or Stripe confirmation.
+// Never apply this exception to checkout creation.
 func xHTTPFailure(err error, status int, retryAfter string, mutation bool) error {
+	wrapped := &statusFailure{cause: err, status: status}
 	if status == http.StatusForbidden && !mutation {
-		return httpFailure(err, http.StatusTooManyRequests, retryAfter)
+		return httpFailure(wrapped, http.StatusTooManyRequests, retryAfter)
 	}
-	return httpFailure(err, status, retryAfter)
+	return httpFailure(wrapped, status, retryAfter)
 }
 
 func (c *xClient) recipient(ctx context.Context, user string) (string, error) {
 	return c.identity(ctx, user, true)
 }
+
 func (c *xClient) identity(ctx context.Context, user string, requireEligible bool) (string, error) {
 	var r struct {
 		Data struct {
@@ -281,6 +258,7 @@ func (c *xClient) identity(ctx context.Context, user string, requireEligible boo
 	}
 	return u.ID, nil
 }
+
 func (c *xClient) quote(ctx context.Context, user string, p Plan) error {
 	var r struct {
 		Data struct {
@@ -307,13 +285,8 @@ func (c *xClient) quote(ctx context.Context, user string, p Plan) error {
 	}
 	return nil
 }
+
 func (c *xClient) create(ctx context.Context, user, recipient string, p Plan) (string, string, error) {
-	if err := c.checkCreation(ctx, time.Now()); err != nil {
-		return "", "", err
-	}
-	if err := reserveCheckoutCreation(c.vault, time.Now()); err != nil {
-		return "", "", err
-	}
 	var r struct {
 		Data struct {
 			Gift struct {
@@ -329,13 +302,15 @@ func (c *xClient) create(ctx context.Context, user, recipient string, p Plan) (s
 	}
 	s := r.Data.Gift
 	if s.Status != "Unpaid" {
-		return "", "", errors.New("X checkout status is not Unpaid; payment was not submitted")
+		return "", "", errors.New("X checkout status is not Unpaid; no link was published")
 	}
 	if !sessionPattern.MatchString(s.ID) {
-		return "", "", errors.New("X checkout session ID is missing or not a live session; payment was not submitted")
+		return "", "", errors.New("X checkout session ID is missing or not a live session; no link was published")
 	}
 	if !sessionURL(s.URL, s.ID) {
-		return "", "", errors.New("X checkout URL is unsupported or does not match its session; payment was not submitted")
+		return "", "", errors.New("X checkout URL is unsupported or does not match its session; no link was published")
 	}
 	return s.ID, s.URL, nil
 }
+
+var usernamePattern = regexp.MustCompile(`^[a-z0-9_]{1,15}$`)

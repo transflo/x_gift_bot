@@ -1,166 +1,212 @@
 # XGift
 
-X (Twitter) Premium 礼品兑换平台。你生成兑换码发给用户，用户在网页上输入兑换码和自己的 X 用户名，系统自动完成 Premium 赠送的下单与付款。
+X (Twitter) Premium 礼品兑换平台。你生成兑换码发给用户；用户在兑换页输入兑换码与自己的 X 用户名，系统从账号池挑选 X 账号、经其绑定的 Shadowsocks 代理创建 **Stripe 付款链接**，用户自行付款后自动核对并显示兑换成功。服务端不接触银行卡，也不保存信用卡信息。
 
-- **兑换页**：用户自助兑换，实时显示处理进度
-- **管理后台**：生成/停用兑换码、批次文件夹、统计面板、订单状态
-- **安全**：凭据逐条 AES-256-GCM 加密存储，付款前逐项校验金额与商户，付款确认只提交一次
+- **首页** `/`：落地页
+- **兑换页** `/redeem/`：输入兑换码与用户名，实时显示生成进度与付款链接，付款后自动更新
+- **管理后台**：兑换码、批次文件夹、统计、X 账号池与代理池、付款链接状态、手动生成链接、Stripe 公钥、站点公告、日志。路径每次安装随机生成，只在启动日志里输出
+- **代理池**：后台每 5 分钟自动测活，检出失败（代理不可达、Cookie 失效、账号被封、被限流）会自动换下一个账号
+- **长期运行**：保管库保留策略 + 日志滚动 + 容器日志上限，磁盘占用在后台「设置」里可见
 
-## 截图
+## Docker Compose 部署（推荐）
 
-以下截图来自本地模拟预览（全部为示例数据）：
-
-| 兑换页 | 管理页（统计概览） |
-|---|---|
-| ![兑换页](docs/screenshots/redeem-light.png) | ![管理页 · 浅色](docs/screenshots/admin-light.png) |
-
-管理页深色模式：
-
-![管理页 · 深色](docs/screenshots/admin-dark.png)
-
-## 本地预览（不写任何真实配置）
-
-想先看看界面？只需要 Node.js 22+：
+准备一台能运行 Docker 的 Linux 服务器、一个解析到该服务器的域名、至少一个 X 账号（`auth_token`、`ct0`）及其对应的 Shadowsocks 代理、以及 X 结账页使用的 `pk_live_` Stripe 公钥（可以稍后在后台「设置」里填）。HTTPS 由宿主机上的反向代理提供，容器只监听 `127.0.0.1`。
 
 ```sh
-npm ci
-npm run build
-npm run preview
-```
-
-打开 http://127.0.0.1:4173 是兑换页，http://127.0.0.1:4173/admin 是管理后台。所有数据都是内存示例，不连接真实服务。在兑换页输入 `XG-` 加 48 个字母 `A` 可以演示完整成功流程。
-
-## 部署教程
-
-### 第一步：准备这些东西
-
-部署前请先准备好以下四样东西，配置向导会逐项询问：
-
-1. **X 登录 Cookie**（`auth_token` 和 `ct0`）：在浏览器登录 x.com 后，按 F12 打开开发者工具 → Application（应用）→ Cookies → `https://x.com`，复制这两项的值。这是系统以你的 X 账号身份发起赠送的凭据。
-2. **用于付款的银行卡（一张或多张）**：卡号、有效期、CVC，以及发卡行登记的持卡人姓名、账单邮箱和账单国家（两位代码，如 `BD`）。多张卡会在服务端加密保存并随机轮换，新卡可复用同一账单资料。请只填真实信息。
-3. **代理（可选）**：服务器能直接访问 x.com 就选「直连」；否则准备一个代理节点。支持 sing-box 的任意 outbound 类型（anytls、socks、http、shadowsocks、vmess、vless、trojan 等），也可以直接粘贴完整 sing-box 配置。
-4. **Stripe 公钥**：X 结账页面使用的 `pk_live_` 开头公钥。使用默认 X Premium 目录时向导会说明；它与商户、商品、价格一起保存在「目录」配置中，也可以完全自定义。
-
-网络路径独立配置：X 账号与资格检查始终直连；生成付款链接所需的地区报价校验与创建链接使用同一个 `proxy` 出口，避免币种和金额因地区不同而变化；X 请求不读取环境代理；Stripe 可使用包含 `direct` 的 `payment-outbounds` 节点池。连接故障触发 6 小时冷却，安全查询最多尝试 3 个出口；付款确认不会自动重放。未配置或空数组时，新订单直连。Stripe 不读取环境代理。详见 [付款节点池配置](docs/payment-outbounds.md)。直接在浏览器打开 Stripe 链接时使用浏览器网络。
-
-另外需要：一台 Linux 服务器、一个指向该服务器的域名、服务器上安装 Go 1.27+（或在自己电脑上构建后上传二进制）。
-
-### 第二步：构建
-
-```sh
-git clone https://github.com/mizorewww/x_gift_bot.git
+git clone https://github.com/transflo/x_gift_bot.git
 cd x_gift_bot
-npm ci && npm run build        # 构建前端（只需一次，产物已随仓库提交时可跳过）
-go build -tags with_quic,with_utls -o bin/xgift ./cmd/xgift
-go build -tags with_quic,with_utls -o bin/xgift-web ./cmd/xgift-web
+cp .env.example .env
+# 编辑 .env：XGIFT_ORIGIN、XGIFT_ADMIN_PASSWORD
+docker compose up -d
 ```
 
-### 第三步：运行配置向导
+首次启动会自动生成保管库密码文件、创建保管库，并写入内置的 X API 授权与默认套餐目录。**保管库密码就在数据卷里，请务必按下面的提示备份**；丢失后所有加密记录都无法恢复。
+
+Stripe 公钥和站点公告都在后台「设置」里配置，保存即生效，不需要重启容器。
+
+启动后看日志拿管理后台地址：
 
 ```sh
-./bin/xgift setup
+docker compose logs xgift | grep 管理后台
 ```
 
-向导会一步步引导你完成配置，全程有中文提示：
+`https://你的域名/` 是首页，`/redeem/` 是兑换页。管理后台地址形如 `https://你的域名/1a2b3c4d5e6f7a8b9c0d/`，登录只用密码（无用户名）。
 
-1. **密码文件** — 自动生成一个随机密码用于加密保管库，保存在你指定的路径（默认 `sqlite/vault-password`，仅本人可读）。**请务必备份这个文件，丢失后所有加密数据无法恢复。**
-2. **X 凭据** — 粘贴第一步准备的两个 Cookie。
-3. **支付卡** — 输入卡信息和账单信息（卡号会自动校验）。想启用多卡轮换，向导完成后用 `xgift cards add` 追加更多卡，缺少的账单字段会自动继承。
-4. **代理** — 选直连、按提示填 AnyTLS 节点，或粘贴 sing-box 配置；保存前会实际启动验证配置是否有效。
-5. **Stripe 公钥** — 粘贴 `pk_live_` 公钥。
-6. **商品目录** — 直接回车使用 X Premium 默认目录（3/6 个月套餐），或自定义商户、币种和套餐。
-7. **站点配置** — 输入你的域名（如 `https://xp.example.com`），向导会生成 `site.env` 和随机的后台管理员密码（只显示一次，同时保存在文件里）。
+X 账号池在后台「账号」标签页添加，每个账号需要 `auth_token`、`ct0` 和一个 Shadowsocks 代理（**仅支持 Shadowsocks**）。
 
-完成后运行 `./bin/xgift status`，六条记录全部显示 `verified` 即为成功。
-
-### 第四步：启动网站
-
-把向导生成的 `site.env`、`admin-password`、`vault-password` 放到安全目录（生产建议 `/etc/xgift/`，权限 0600），然后：
+## 日常运维
 
 ```sh
-sudo systemctl link $PWD/deploy/xgift.service   # 或直接复制到 /etc/systemd/system/
-# 编辑 deploy/xgift.service 中的路径使其与你的安装位置一致
+docker compose logs -f xgift                    # 日志（含管理后台地址）
+docker compose run --rm xgift sh -c 'cat /data/vault-password'   # 保管库密码（后台首页也能看）
+
+# 其余命令都带同样的保管库参数，先设好变量
+V="--db /data/vault.db --password-file /data/vault-password"
+X="docker compose run --rm xgift"
+
+$X status $V                                    # 校验全部加密记录
+$X accounts list $V                             # 查看账号池
+$X accounts test $V                             # 立即测活全部账号
+$X link alice --months 3 $V                     # 生成一次性付款链接（无需兑换码）
+```
+
+**备份**：所有状态都在 named volume `xgift-data`（`vault.db`、`site.db`、`logs/`、`vault-password`、`admin-path`）。定期备份整个卷；`vault-password` 单独丢失同样会导致记录无法恢复。
+
+**更新**：`git pull && docker compose build && docker compose up -d`。数据库升级是增量式的，已有兑换码与订单会保留。
+
+## 反向代理
+
+容器只绑定 `127.0.0.1:${XGIFT_PORT:-8787}`，HTTPS 由宿主机负责。反代**必须传递 `X-Real-IP`**，否则限流会把所有请求算到代理这一个 IP 上。
+
+`deploy/Caddyfile` 是可直接加载的 Caddy 模板（设置 `XGIFT_DOMAIN` 即自动申请证书）。Nginx 对应配置：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+## 环境变量
+
+`docker compose` 从项目根目录的 `.env` 读取；裸机部署由 `site.env` 或 systemd `EnvironmentFile` 提供。
+
+| 变量 | 说明 |
+|---|---|
+| `XGIFT_ORIGIN` | 站点完整域名，必须 `https://` 开头，用于 Origin 校验。不能带尾斜杠 |
+| `XGIFT_ADMIN_PASSWORD` | 后台管理员密码，至少 32 字符。生成：`openssl rand -base64 24` |
+| `XGIFT_STRIPE_KEY` | 可选的 `pk_live_` 公钥（公开密钥）。**仅在记录为空时写入**，之后请改后台「设置」 |
+| `XGIFT_PORT` | 宿主机监听端口，默认 8787 |
+| `XGIFT_PAYMENTS_ENABLED` | `true` 开放前台兑换，`false` 暂停（不消耗兑换码） |
+| `XGIFT_TURNSTILE_SITE_KEY` / `XGIFT_TURNSTILE_SECRET_FILE` | 可选 Cloudflare Turnstile 人机验证，两者必须同时配置 |
+
+以下仅在裸机部署或需要覆盖默认值时使用：`XGIFT_LISTEN`（默认 `127.0.0.1:8787`）、`XGIFT_ALLOW_PUBLIC_LISTEN`（监听非回环地址必须设为 `true`）、`XGIFT_DATA_DIR`（必填）、`XGIFT_PASSWORD_FILE`（默认 `$XGIFT_DATA_DIR/vault-password`）、`XGIFT_ADMIN_PASSWORD_FILE`（`XGIFT_ADMIN_PASSWORD` 的替代）。
+
+`/livez` 是存活探针（进程与数据库可用即 200，Docker 健康检查用它）；`/healthz` 是就绪探针，账号池为空时返回 503。
+
+## 后台「设置」
+
+- **Stripe 公钥**：校验格式后写入保管库，可用于替换 `XGIFT_STRIPE_KEY` 的初始值。同页显示套餐目录解析出的商户、币种与金额，用来核对配置是否生效。
+- **站点公告**：开启后在首页与兑换页顶部显示一条横幅，可选普通／提醒／重要三种语气，保存即生效，不需要重新构建镜像。
+- **存储占用**：所在分区剩余空间、各数据库与日志文件体积、每一类保管库记录的条数与占用。
+
+## 日志
+
+后台「日志」标签页展示最近的访问与事件记录，并可按级别筛选、下载完整的 JSONL 文件。日志写在数据卷的 `logs/` 下，单文件上限 8 MB、保留 4 个归档，总量不会超过 32 MB；`docker-compose.yml` 另外给容器日志设了 10 MB × 3 的上限。
+
+记录内容包括请求方法、路径、状态码、耗时、User-Agent、Referer，以及**访问者真实 IP**，还有订单事件（链接生成、付款确认、生成失败）和管理员操作。
+
+IP 取自反向代理的 `X-Real-IP`，其次 `X-Forwarded-For`，都没有时才退回连接来源——在容器里那会是代理的内网地址（通常形如 `172.x.x.x`），这正是反代必须传递真实 IP 头的原因。看日志时如果满屏是内网地址，就是反代漏了这一步。
+
+请求 URL 中的查询参数不写入日志，所以下载下来的文件可以直接交给他人查看。
+
+## 存储与清理
+
+系统每天自动清理一次（启动 5 分钟后执行第一次，也可以在「设置」里点「立即清理」）：
+
+| 记录 | 保留 |
+|---|---|
+| 付款会话快照 `checkout-verification:` | 30 天 |
+| Stripe 错误诊断 `stripe-error:` | 30 天 |
+| 付款完成凭证 `checkout-completion:` | 90 天 |
+| 换链接历史 `checkout-history:` | 90 天 |
+
+兑换码原文、订单绑定、账号池、API 授权与套餐目录**不会**被删除——它们是业务数据，不是运行痕迹。清理后如果碎片占比明显会执行一次 `VACUUM`，并截断 SQLite 的 WAL 文件。
+
+升级到带保留策略的版本时，已有记录的时间戳会从升级那一刻开始计算，不会立刻被删。
+
+## 工作方式
+
+1. 用户提交兑换码与 X 用户名；服务端校验后立即绑定，并在后台开始生成链接。
+2. 选账号时优先沿用该订单已绑定的账号，否则选等待时间最短的账号。每个账号有 15 秒创建间隔与 3 分钟未付款窗口，天然形成账号级负载均衡。
+3. 服务端经该账号的 Shadowsocks 代理调用 X GraphQL API 创建赠送订单，并只读访问 Stripe 校验商户、商品、金额、收件人与 `Unpaid` 状态；全部通过后才把链接推给前台。
+4. 用户自行在 Stripe 付款；后台定期只读轮询会话状态，成功后把兑换码标记为已完成。
+5. 链接过期或被支付机构拒绝时，用户可对同一兑换码手动重新生成一次，之后需联系管理员。
+
+后台「兑换码」列表的付款链接列显示每笔订单的链接状态——待付款（带剩余时间倒计时）、已过期、已拒绝、已付款，点开可以查看链接全文、有效期、绑定的 X 账号与订单消息。
+
+X 请求不读取环境代理，全部走账号绑定的 Shadowsocks 出口；Stripe 只读校验复用同一出口，保证地区价格一致。
+
+### 代理测活与故障转移
+
+后台每 5 分钟探测所有启用账号（经其代理 HEAD `x.com`）。**连续 3 次失败**的账号会被排到选号队列末尾，恢复后自动回到正常。
+
+检出过程中遇到账号侧问题会**自动换下一个账号**重试：代理不可达、Cookie 失效（401/403）、账号不存在（404）、被限流（429）。X 自身的 5xx 不算账号问题，仍走原来的退避重试，不浪费账号池。
+
+后台账号列表的「测活」列显示每个账号最近一次探测结果，点「测试」可立即探测。
+
+## 命令行参考
+
+```
+xgift setup                      交互式首次配置（可选：自定义套餐目录或预装账号池时才需要）
+xgift init                       从 stdin 读取 JSON 记录创建保管库（accounts/api-auth/stripe-key/catalog）
+xgift status                     校验账号池、API 授权、Stripe 公钥与套餐目录
+xgift put --name <name>          覆盖单个加密记录
+xgift accounts list|add|remove|enable|disable|test   管理 X 账号池
+xgift check                      测试全部账号代理到 X 的连通性
+xgift link <username> --months N 生成或复用付款链接并打印 URL
+```
+
+`accounts add` 从 stdin 读取账号 JSON 数组（`id` 可省略，系统自动生成）：
+
+```json
+[{ "label": "主账号", "auth_token": "....", "ct0": "....", "enabled": true,
+   "proxy": { "type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+              "method": "aes-256-gcm", "password": "...." } }]
+```
+
+每个账号必须绑定一个 Shadowsocks 代理，其他代理类型会被拒绝。
+
+## 裸机部署
+
+需要 Node.js 20.9+ 与 Go 1.27+：
+
+```sh
+npm --prefix web ci
+npm --prefix web run build                    # 静态导出并复制到 internal/site/web
+CGO_ENABLED=1 go build -tags with_quic,with_utls -o bin/xgift     ./cmd/xgift
+CGO_ENABLED=1 go build -tags with_quic,with_utls -o bin/xgift-web ./cmd/xgift-web
+```
+
+按 `deploy/site.env.example` 准备 `/etc/xgift/site.env`（0600），填好 `XGIFT_ORIGIN`、`XGIFT_ADMIN_PASSWORD`（`XGIFT_STRIPE_KEY` 可选），首次启动会自动建库并生成保管库密码。按需修改 `deploy/xgift.service` 后：
+
+```sh
+sudo systemctl link $PWD/deploy/xgift.service
 sudo systemctl enable --now xgift
 ```
 
-`site.env` 各字段含义：
+`deploy/Caddyfile` 是宿主机反向代理模板，设置 `XGIFT_DOMAIN` 后加载即可。
 
-| 字段 | 说明 |
-|---|---|
-| `XGIFT_ORIGIN` | 站点完整域名（`https://` 开头） |
-| `XGIFT_LISTEN` | 监听地址，只能回环，如 `127.0.0.1:8787` |
-| `XGIFT_DATA_DIR` | 数据目录（vault.db、site.db 所在） |
-| `XGIFT_PASSWORD_FILE` | 保管库密码文件路径 |
-| `XGIFT_ADMIN_PASSWORD_FILE` | 后台密码文件路径 |
-| `XGIFT_PAYMENTS_ENABLED` | `true` 开放充值，`false` 暂停（不消耗兑换码） |
+需要自定义套餐目录或预装账号池时，再运行 `./bin/xgift setup` 交互式向导。
 
-### 第五步：配置 HTTPS 反向代理
+## 安全
 
-程序只监听本机端口，需要 Caddy（或任意反向代理）提供 HTTPS。`deploy/Caddyfile` 是模板，把 `xp.example.com` 替换成你的域名后放到 Caddy 配置目录并 reload 即可。模板默认只放行 Cloudflare 回源 IP，不用 Cloudflare 时删掉 `@cloudflare` 相关段、保留 `reverse_proxy` 即可。
+- 敏感记录（X Cookie、代理密码、Stripe 公钥、兑换码明文）逐条 AES-256-GCM 加密后存入 SQLite 保管库。
+- 后台路径每次安装随机生成（`admin-path`，0600），只在启动日志输出；公开页面不含任何指向它的链接。
+- 后台使用 Basic Auth（仅密码）；`/api/*` 与后台路径按 IP 限流，超出返回 429。
+- 每个响应使用独立 CSP nonce，禁止内联脚本与外部资源；静态资源由 Go 二进制内嵌提供。
+- 服务端不包含任何银行卡数据，也不会向 Stripe 提交付款。
 
-验证：
+> 随机路径只是让登录页躲开自动扫描，真正的防线是密码。`XGIFT_ADMIN_PASSWORD` 请用 `openssl rand -base64 24` 生成。
 
-```sh
-curl https://你的域名/healthz     # {"ok":true,...} 即成功
-```
-
-### 第六步：开始使用
-
-浏览器打开 `https://你的域名/admin`，输入用户名 `admin` 和向导生成的密码：
-
-1. 在「生成兑换码」选套餐、数量、批次名，点生成，复制或下载兑换码发给用户。
-2. 顶部「统计概览」随时查看兑换进度和成功率。
-3. 用户打开 `https://你的域名`，输入兑换码和 X 用户名即可完成充值。
-
-## 日常维护
+## 开发
 
 ```sh
-./bin/xgift status              # 检查所有加密记录是否完好
-./bin/xgift check               # 测试代理能否访问 x.com
-./bin/xgift import-chrome       # macOS：从本机 Chrome 重新导入 X Cookie（过期时用）
+# 前端（Next.js 16 + shadcn/ui）
+cd web
+npm ci
+npm run dev        # 开发服务器
+npm run typecheck
+npm run build      # 静态导出 + 复制到 ../internal/site/web
+
+# 后端
+go test ./...
+go build ./cmd/...
 ```
 
-更新配置用 `put`（从标准输入读取新值）：
+Docker 构建依次执行前端导出与 Go 编译，最终镜像只包含 `xgift` 与 `xgift-web` 两个二进制和运行时依赖。
 
-```sh
-./bin/xgift cards list                                     # 查看卡池和当前轮换组合（只显示尾号）
-echo '{"number":"...","exp_month":"05","exp_year":"2031","cvc":"123"}' | ./bin/xgift cards add
-echo '新的ct0等JSON' | ./bin/xgift put --name cookies      # 还有 card / cards / proxy / api-auth
-echo 'pk_live_新公钥' | ./bin/xgift put --name stripe-key
-echo '{"merchant":"acct_...","currency":"bdt","plans":[...]}' | ./bin/xgift put --name catalog
-```
+首页是一屏内容：一句标题、一个按钮，背景是一块由 CSS 画出的柔光。这一页不含任何图片或视频，也不下发客户端 JS——`web/app/page.tsx` 是服务端组件，改背景只需改 `Backdrop` 里那个径向渐变。
 
-付款卡按「卡 × 节点」组合随机轮换：每 3 个连续订单使用同一组合；任意订单被拒后立即换组合，被拒的那张卡进入 30 分钟冷却（其他卡继续轮换），补单也走同一逻辑。支付方明确 `do_not_try_again` 时该卡永久封锁直到显式解除。`cards add` 追加或更新（同卡号替换），`cards remove --last4 1234` 移除，`cards rotate` 立即结束当前组合，`cards unblock` 清除冷却与永久封锁。
-
-## 常见问题
-
-**密码文件丢了怎么办？** 无法恢复。加密数据全部作废，需要删除 `vault.db` 后重新运行 `xgift setup`。请把它和数据库一起备份。
-
-**X Cookie 过期了？** macOS 上用 `./bin/xgift import-chrome` 一键刷新；其他系统重新从浏览器复制后用 `put --name cookies` 更新。
-
-**想暂停充值？** 把 `site.env` 里 `XGIFT_PAYMENTS_ENABLED` 改为 `false` 并重启服务。用户兑换会被婉拒，兑换码不消耗。
-
-**付款被拒怎么办？** 明确拒付会显示失败说明并阻止重复提交，不再显示自动核实。网页和 CLI 在同一个 `checkout.lock` 下执行付款，提交间隔至少 30 秒，重启仍保留间隔。付款按「卡 × 节点」组合随机轮换，每 3 个连续订单使用同一组合；普通拒付会立即结束当前组合，并**先冷却该出口节点及其共享 IP（30 分钟）**，同一张卡马上换其他节点继续付款；只有同一张卡在两个不同节点都被拒，才冷却整卡 30 分钟。其他卡继续轮换，下一次提交（含补单）自动换到新的组合，不因连续次数暂停全站。支付端明确返回 `do_not_try_again` 时只永久封锁被拒的那张卡；仅当所有卡都被永久封锁时才暂停全站，可用 `xgift cards unblock` 显式解除（同时清除冷却，不能通过补单确认框解除）。后台补单页会实时显示每张卡的可用/冷却状态和当前组合。该命令不付款，也不会修改 `XGIFT_PAYMENTS_ENABLED`。手动完成原账单后，可查询原订单以核对成功状态。
-
-**付款结果不明怎么办？** 系统宁可标记「待核实」也不会重复扣款。用户用原兑换码点「重新检查并继续兑换」即可自动核对，确认成功后自动补上状态。
-
-**升级程序？** 重新构建两个二进制，备份数据目录和密码文件，替换后 `systemctl restart xgift`。不要覆盖线上数据库。
-
-## 数据与安全
-
-- `vault.db`：所有敏感信息（Cookie、卡、代理、订单）逐条 AES-256-GCM 加密，密钥由密码文件派生。没有密码文件谁也读不了。
-- `site.db`：兑换码只存摘要和尾号，不存明文；用户名、状态为明文。请限制文件权限。
-- 所有密钥文件均为 0600（仅本人可读）；后台使用 HTTPS Basic Auth；接口有限流和同源校验。
-
-### 管理员手动补单
-
-登录 `/admin`，使用「预览并补单」查看所有 `review` 订单、每笔金额和当前轮换卡尾号，勾选确认后点击「确认付款并启动补单」。补单与普通付款共用同一套卡 × 节点轮换逻辑：被拒订单会换到新组合，同一批次的后续订单继续沿用新组合。此操作会发起真实付款，独立于公开充值入口的 `XGIFT_PAYMENTS_ENABLED` 开关；预览、状态查询、部署或服务重启均不会启动付款。预览有效期为 10 分钟，卡池配置或订单内容发生变化时必须重新预览。
-
-补单在服务器后台串行执行，订单之间至少等待 30 秒，并保留全局付款间隔。每批每单最多尝试一次；已付款只同步结果，未知付款结果、银行验证、禁止重试指令和不匹配的账单不会重付。有效会话会复用并重新核验商户、客户、套餐、金额及未收款/未授权金额证据。旧会话失效时，管理员必须确认已核对原订单未扣款；系统还要求原始明确拒付、对应的失败查询记录，以及再次通过的账号资格和价格检查，才会归档旧订单并生成新链接。未知付款结果、禁止重试指令不会因该确认而放行。每个原会话最多允许 3 次人工重试。普通拒付不再累计触发全站暂停；支付方明确禁止重试的暂停不能从此按钮解除。
-
-「停止后续订单」会让当前订单完成核实后停止。关闭浏览器不影响任务；服务重启会将运行中的任务标记为中断，不会自动恢复扣款。重新预览后，结果不明的原付款仍被排除。任务及历史记录保存在加密 vault 的 `admin-recovery:*`，原付款记录保存在 `manual-previous:*`，核验依据保存在 `manual-preflight:*`，诊断错误保存在 `manual-recovery-error:*`。页面仅显示卡尾号，不接收卡号或安全码。
-
-
-管理页的「按客户查卡密 / 单独补单」支持输入 X 用户名，跨批次读取绑定订单、解密并验证完整卡密，查看当前付款链接。兑换码列表的「查看卡密 / 补单」打开同一详情。历史仅存哈希的卡密不能还原，但单独补单直接使用订单 ID，不依赖卡密明文。
-
-「仅生成补单链接」与「单独补单」分别创建 `links` 和 `pay` 模式的预览；前者在服务端不调用卡片令牌化或付款确认接口，付款保护暂停时也不解除保护。两种模式都只处理预览绑定的客户。失效账单替换使用 vault 原子事务保存 `replacement-original:<旧会话>` 审计并安装新订单记录，保留人工未扣款确认、历史失败证据、前一个会话和替换次数。有效未支付链接会直接复用；生成新链接后可以在客户详情查看。服务器重启不会自动继续任务。
+`web/public/` 下的文件会被 `go:embed` 一并打进二进制，所以不再使用的素材要删掉：放过一个 4 MB 的视频，就同时重了首屏和二进制。

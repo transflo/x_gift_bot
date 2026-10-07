@@ -22,12 +22,12 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var c codeRow
-	e := s.db.QueryRow("SELECT id,hint,batch,months,status,username,message,created,updated,progress,COALESCE(folder_id,''),copyable FROM codes WHERE hash=?", hash(q.Code)).Scan(&c.ID, &c.Hint, &c.Batch, &c.Months, &c.Status, &c.Username, &c.Message, &c.Created, &c.Updated, &c.Progress, &c.Folder, &c.Copyable)
-	if errors.Is(e, sql.ErrNoRows) {
+	err := scanCode(s.db.QueryRow("SELECT "+codeColumns+" FROM codes WHERE hash=?", hash(q.Code)), &c)
+	if errors.Is(err, sql.ErrNoRows) {
 		message(w, 404, "没有找到这个兑换码，请核对后重试。")
 		return
 	}
-	if e != nil {
+	if err != nil {
 		message(w, 503, "暂时无法查询兑换码，请稍后重试。")
 		return
 	}

@@ -4,14 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/url"
 	"strings"
+
 	"xgift/internal/vault"
 )
 
 // rememberVerifiedCheckout preserves the merchant/product/price binding before
-// a visitor pays outside this process. Public payments have no server-side
-// confirmation request, so verifySubmission cannot be used for their result.
+// a visitor pays outside this process. There is no server-side confirmation
+// request for public links, so verifySubmission cannot be used for their result.
 func rememberVerifiedCheckout(v *vault.Vault, r *Record, plan Plan, page *paymentPage) error {
 	if err := page.guard(r, plan, false); err != nil {
 		return err
@@ -27,20 +29,16 @@ func rememberVerifiedCheckout(v *vault.Vault, r *Record, plan Plan, page *paymen
 	return v.Put("checkout-verification:"+r.SessionID, raw)
 }
 
-func verifiedCheckoutPaid(ctx context.Context, v *vault.Vault, r *Record, plan Plan) (bool, error) {
-	s, err := newStripe(ctx, v, r.RecipientID, paymentRead)
+func verifiedCheckoutPaid(ctx context.Context, v *vault.Vault, x *xClient, r *Record, plan Plan) (bool, error) {
+	s, err := x.stripe(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer s.close()
-	return s.verifiedCheckoutPaid(ctx, r, plan)
-}
-
-func (s *stripeClient) verifiedCheckoutPaid(ctx context.Context, r *Record, plan Plan) (bool, error) {
 	if !sessionURL(r.URL, r.SessionID) || r.Months != plan.Months || r.Amount != plan.Minor || !strings.EqualFold(r.Currency, plan.Currency) || r.ProductID != plan.ProductID || plan.Merchant == "" {
 		return false, errors.New("checkout completion binding is invalid")
 	}
-	raw, err := s.vault.Get("checkout-verification:" + r.SessionID)
+	raw, err := v.Get("checkout-verification:" + r.SessionID)
 	if err != nil {
 		return false, err
 	}
@@ -52,10 +50,10 @@ func (s *stripeClient) verifiedCheckoutPaid(ctx context.Context, r *Record, plan
 	if err = original.guard(r, plan, false); err != nil {
 		return false, err
 	}
-	// The completed session's init endpoint may no longer be available. Read the
-	// result endpoint directly, anchored to the previously guarded full snapshot.
+	// The completed session's init endpoint may no longer be available. Read
+	// the result endpoint directly, anchored to the guarded snapshot above.
 	var result json.RawMessage
-	if err = s.call(ctx, "GET", "payment_pages/"+r.SessionID+"/poll", url.Values{}, "", &result); err != nil {
+	if err = s.call(ctx, http.MethodGet, "payment_pages/"+r.SessionID+"/poll", url.Values{}, &result); err != nil {
 		return false, err
 	}
 	defer clear(result)
@@ -83,7 +81,7 @@ func (s *stripeClient) verifiedCheckoutPaid(ctx context.Context, r *Record, plan
 	if p.State != "succeeded" || p.PaymentStatus != "succeeded" {
 		return false, nil
 	}
-	if err = s.vault.Put("checkout-completion:"+r.SessionID, result); err != nil {
+	if err = v.Put("checkout-completion:"+r.SessionID, result); err != nil {
 		return false, err
 	}
 	return true, nil

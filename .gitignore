@@ -14,6 +14,17 @@ __pycache__/
 /bin/
 
 .playwright-cli/
+.playwright-mcp/
 .cloudflare/
 node_modules/
 .artifacts/
+/landing-*.png
+
+# Next.js frontend
+/web/node_modules/
+/web/.next/
+/web/out/
+
+# Generated static export (built into the Docker image)
+/internal/site/web/*
+!/internal/site/web/.gitkeep

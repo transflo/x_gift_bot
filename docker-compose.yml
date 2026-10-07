@@ -1,0 +1,29 @@
+name: xgift
+
+services:
+  xgift:
+    build: .
+    image: xgift:latest
+    container_name: xgift
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 容器内必须监听 0.0.0.0 才能被端口映射转发；对外暴露由下面的
+      # 宿主机 127.0.0.1 绑定收敛，Caddy/Nginx 由宿主机自行提供 HTTPS。
+      XGIFT_LISTEN: 0.0.0.0:8787
+      XGIFT_ALLOW_PUBLIC_LISTEN: "true"
+      XGIFT_DATA_DIR: /data
+    ports:
+      - "127.0.0.1:${XGIFT_PORT:-8787}:8787"
+    volumes:
+      - xgift-data:/data
+    # 默认的 json-file 驱动不设上限：长期运行会把 stdout 全留在宿主机磁盘上。
+    # 应用自身的日志已经落在数据卷里并按大小滚动，这里再兜一层。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  xgift-data:

@@ -1,0 +1,31 @@
+# Docker build inputs
+.git
+.gitignore
+.github
+.agents
+docs
+deploy
+*.md
+!README.md
+
+# Host-side Node artifacts (the web stage builds its own)
+web/node_modules
+web/.next
+web/out
+
+# Embedded export is produced inside the image
+internal/site/web
+
+# Local runtime data and binaries
+sqlite
+bin
+data
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+site.env
+admin-password
+vault-password

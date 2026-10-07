@@ -9,35 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
-	"time"
 
 	"golang.org/x/term"
 
+	"xgift/internal/accounts"
 	"xgift/internal/checkout"
-	"xgift/internal/proxy"
 	"xgift/internal/vault"
 )
-
-const defaultBearer = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-const defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-
-// X's public gifting product identifiers as discovered from x.com checkout.
-// They are merchant-side identifiers published by X, not operator secrets.
-const (
-	defaultXMerchant   = "acct_1Ika5JA3KZ32dPo1"
-	defaultXCurrency   = "bdt"
-	defaultXProduct3Mo = "prod_TJXJtpzqCpI36N"
-	defaultXProduct6Mo = "prod_TJXKKNJwZJIhCM"
-)
-
-var stripeKeyPattern = regexp.MustCompile(`^pk_live_[A-Za-z0-9]+$`)
 
 type wizard struct {
 	r   *bufio.Reader
@@ -104,28 +85,6 @@ func (w *wizard) yesNo(label string, def bool) (bool, error) {
 	return false, errors.New("请输入 y 或 n")
 }
 
-func tail(s string) string {
-	if len(s) <= 4 {
-		return "****"
-	}
-	return s[len(s)-4:]
-}
-
-func luhnValid(number string) bool {
-	sum := 0
-	for i, n := range number {
-		d := int(n - '0')
-		if (len(number)-i)%2 == 0 {
-			d *= 2
-			if d > 9 {
-				d -= 9
-			}
-		}
-		sum += d
-	}
-	return sum%10 == 0
-}
-
 func writeOwnerOnly(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
@@ -141,572 +100,253 @@ func writeOwnerOnly(path string, data []byte) error {
 	return f.Close()
 }
 
-func ephemeralPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	_, p, err := net.SplitHostPort(l.Addr().String())
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(p)
-}
-
 // runSetup is the interactive first-time wizard; it refuses to touch an
-// existing vault so updates keep going through put/billing/import-chrome.
+// existing vault so updates keep going through put/accounts.
 func runSetup(ctx context.Context, db, passwordFileFlag string) error {
 	w := &wizard{r: bufio.NewReader(os.Stdin), tty: term.IsTerminal(int(os.Stdin.Fd()))}
-	fmt.Println("xgift 首次配置向导")
-	fmt.Println("将创建加密保管库并写入 X 凭据、支付卡、代理与站点配置。")
-	fmt.Println()
-
-	if _, err := os.Stat(db); !os.IsNotExist(err) {
-		return fmt.Errorf("保管库已存在或路径不可访问：%s（更新凭据请使用 put / billing / import-chrome）", db)
+	fmt.Println("XGift 配置向导")
+	fmt.Println("本向导会依次配置：保管库密码、X 账号池（每个账号一个 Shadowsocks 代理）、Stripe 公钥、套餐目录和站点。")
+	if passwordFileFlag == "" {
+		passwordFileFlag = filepath.Join(filepath.Dir(db), "vault-password")
 	}
-
-	defaultPasswordFile := filepath.Join(filepath.Dir(db), "vault-password")
-	if passwordFileFlag != "" {
-		defaultPasswordFile = passwordFileFlag
-	}
-	passwordFile, err := w.prompt("密码文件保存路径", defaultPasswordFile)
+	passwordPath, err := w.prompt("密码文件路径（用于加密保管库，请务必备份）", passwordFileFlag)
 	if err != nil {
 		return err
 	}
-	if _, err = os.Stat(passwordFile); !os.IsNotExist(err) {
-		return fmt.Errorf("密码文件已存在或路径不可访问：%s", passwordFile)
-	}
-
 	password := make([]byte, 32)
 	if _, err = rand.Read(password); err != nil {
 		return err
 	}
-	encoded := []byte(base64.RawURLEncoding.EncodeToString(password) + "\n")
-	clear(password)
-	defer clear(encoded)
-	if err = writeOwnerOnly(passwordFile, encoded); err != nil {
+	if err = writeOwnerOnly(passwordPath, []byte(base64.RawURLEncoding.EncodeToString(password)+"\n")); err != nil {
+		return fmt.Errorf("密码文件无法写入（可能已存在）: %w", err)
+	}
+	if err = os.MkdirAll(filepath.Dir(db), 0700); err != nil {
 		return err
 	}
-	fmt.Printf("密码文件已生成：%s（0600，请备份，丢失后无法恢复保管库）\n", passwordFile)
-	if err = writeOwnerOnly(filepath.Join(filepath.Dir(db), "password-path"), []byte(passwordFile+"\n")); err != nil {
-		return err
-	}
-	v, err := vault.Open(db, passwordFile, true)
+	v, err := vault.Open(db, passwordPath, true)
 	if err != nil {
 		return err
 	}
 	defer v.Close()
-	fmt.Printf("加密保管库已创建：%s\n\n", db)
+	fmt.Printf("已创建加密保管库：%s\n\n", db)
 
-	steps := []func() error{
-		func() error { return w.setupXCredentials(v) },
-		func() error { return w.setupCard(v) },
-		func() error { return w.setupProxy(ctx, v) },
-		func() error { return w.setupStripeKey(v) },
-		func() error { return w.setupCatalog(v) },
-	}
-	for _, step := range steps {
-		if err = step(); err != nil {
-			fmt.Println()
-			fmt.Printf("配置未完成：%v\n", err)
-			fmt.Println("已创建的保管库会保留已写入的记录。修复方式：")
-			fmt.Printf("  1) 删除 %s、%s 和旁边的 password-path 后重新运行 setup；或\n", db, passwordFile)
-			fmt.Println("  2) 用 put --name <proxy|card|cookies|api-auth|stripe-key|catalog> / billing / import-chrome 补写缺失记录，")
-			fmt.Println("     再以 status 确认全部记录就绪。")
-			return err
-		}
-	}
-	siteConfigured, err := w.setupSite(db, passwordFile)
-	if err != nil {
+	if err = w.setupXAPI(v); err != nil {
 		return err
 	}
-
-	fmt.Println()
-	fmt.Println("配置完成。")
-	fmt.Printf("保管库：%s\n密码文件：%s\n", db, passwordFile)
-	fmt.Println("已写入记录：cookies、api-auth、card、proxy、stripe-key、catalog")
-	if siteConfigured {
-		fmt.Printf("站点配置：%s\n", filepath.Join(filepath.Dir(db), "site.env"))
+	if err = w.setupAccounts(ctx, v); err != nil {
+		return err
 	}
-	fmt.Println("下一步：xgift status 验证记录；xgift check 验证代理连通；")
-	fmt.Println("使用生成的 site.env 启动 xgift-web（详见 README 部署章节）。")
-	return nil
+	if err = w.setupStripeKey(v); err != nil {
+		return err
+	}
+	if err = w.setupCatalog(v); err != nil {
+		return err
+	}
+	return w.setupSite(filepath.Dir(db), passwordPath)
 }
 
-func (w *wizard) setupXCredentials(v *vault.Vault) error {
-	fmt.Println("—— X 凭据 ——")
-	fmt.Println("从已登录 x.com 的浏览器获取 auth_token 与 ct0（macOS 之后可用 import-chrome 刷新）。")
-	authToken, err := w.secret("auth_token")
+func (w *wizard) setupXAPI(v *vault.Vault) error {
+	fmt.Println("【1/5】X API 授权")
+	fmt.Println("直接回车使用内置的公开 Web Bearer（与网页版一致）。")
+	bearer, err := w.prompt("Authorization Bearer", checkout.DefaultAPIAuthorization)
 	if err != nil {
 		return err
 	}
-	if authToken == "" || strings.ContainsAny(authToken, "\r\n;") {
-		return errors.New("auth_token 不能为空且不能包含换行或分号")
-	}
-	ct0, err := w.secret("ct0")
+	ua, err := w.prompt("User-Agent", checkout.DefaultAPIUserAgent)
 	if err != nil {
 		return err
 	}
-	if ct0 == "" || strings.ContainsAny(ct0, "\r\n;") {
-		return errors.New("ct0 不能为空且不能包含换行或分号")
+	if !strings.HasPrefix(bearer, "Bearer ") {
+		bearer = "Bearer " + bearer
 	}
-	cookies, err := json.Marshal(map[string]any{"cookies": []map[string]string{
-		{"name": "auth_token", "value": authToken, "domain": ".x.com"},
-		{"name": "ct0", "value": ct0, "domain": ".x.com"},
-	}})
-	if err != nil {
-		return err
-	}
-	defer clear(cookies)
-	if err = v.Put("cookies", cookies); err != nil {
-		return err
-	}
-
-	authorization, err := w.prompt("Authorization 请求头（留空使用 X 网页版默认 Bearer）", "")
-	if err != nil {
-		return err
-	}
-	if authorization == "" {
-		authorization = defaultBearer
-	}
-	if !strings.HasPrefix(authorization, "Bearer ") {
-		return errors.New("Authorization 必须以 \"Bearer \" 开头")
-	}
-	userAgent, err := w.prompt("User-Agent（留空使用当前 macOS 版 Chrome）", "")
-	if err != nil {
-		return err
-	}
-	if userAgent == "" {
-		userAgent = defaultUserAgent
-	}
-	auth, err := json.Marshal(map[string]string{"Authorization": authorization, "UserAgent": userAgent})
-	if err != nil {
-		return err
-	}
-	defer clear(auth)
-	if err = v.Put("api-auth", auth); err != nil {
-		return err
-	}
-	fmt.Printf("已保存 X 凭据（auth_token 尾号 %s）\n\n", tail(authToken))
-	return nil
+	data, _ := json.Marshal(map[string]string{"Authorization": bearer, "UserAgent": ua})
+	defer clear(data)
+	return v.Put("api-auth", data)
 }
 
-func (w *wizard) setupCard(v *vault.Vault) error {
-	fmt.Println("—— 支付卡 ——")
-	fmt.Println("只填写发卡行登记的真实信息。")
-	card := map[string]string{}
-
-	number, err := w.secret("卡号（仅数字，可含空格或连字符）")
-	if err != nil {
-		return err
-	}
-	number = strings.NewReplacer(" ", "", "-", "").Replace(number)
-	if !regexp.MustCompile(`^[0-9]{12,19}$`).MatchString(number) || !luhnValid(number) {
-		return errors.New("卡号无效（12-19 位数字且须通过校验）")
-	}
-	card["number"] = number
-
-	month, err := w.prompt("有效期月份（01-12）", "")
-	if err != nil {
-		return err
-	}
-	if regexp.MustCompile(`^[1-9]$`).MatchString(month) {
-		month = "0" + month
-	}
-	if !regexp.MustCompile(`^(0[1-9]|1[0-2])$`).MatchString(month) {
-		return errors.New("有效期月份必须是 01-12")
-	}
-	year, err := w.prompt("有效期年份（4 位）", "")
-	if err != nil {
-		return err
-	}
-	if !regexp.MustCompile(`^[0-9]{4}$`).MatchString(year) {
-		return errors.New("有效期年份必须是 4 位数字")
-	}
-	y, _ := strconv.Atoi(year)
-	m, _ := strconv.Atoi(month)
-	if !time.Now().Before(time.Date(y, time.Month(m)+1, 1, 0, 0, 0, 0, time.UTC)) {
-		return errors.New("卡片已过期")
-	}
-	card["exp_month"] = month
-	card["exp_year"] = year
-
-	cvc, err := w.secret("CVC（3-4 位）")
-	if err != nil {
-		return err
-	}
-	if !regexp.MustCompile(`^[0-9]{3,4}$`).MatchString(cvc) {
-		return errors.New("CVC 必须是 3-4 位数字")
-	}
-	card["cvc"] = cvc
-
-	name, err := w.prompt("持卡人姓名", "")
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(name) == "" {
-		return errors.New("持卡人姓名不能为空")
-	}
-	card["billing_name"] = name
-
-	email, err := w.prompt("账单邮箱", "")
-	if err != nil {
-		return err
-	}
-	at := strings.Index(email, "@")
-	if at < 1 || !strings.Contains(email[at+1:], ".") {
-		return errors.New("邮箱格式无效")
-	}
-	card["email"] = email
-
-	country, err := w.prompt("账单国家（两位代码，如 BD）", "")
-	if err != nil {
-		return err
-	}
-	country = strings.ToUpper(country)
-	if !regexp.MustCompile(`^[A-Z]{2}$`).MatchString(country) {
-		return errors.New("账单国家必须是两位字母代码")
-	}
-	card["billing_country"] = country
-
-	for _, opt := range []struct{ key, label string }{
-		{"billing_postal_code", "账单邮编（可选，留空跳过）"},
-		{"billing_address_line1", "账单地址行 1（可选，留空跳过）"},
-		{"billing_address_line2", "账单地址行 2（可选，留空跳过）"},
-		{"billing_city", "账单城市（可选，留空跳过）"},
-		{"billing_state", "账单州/省（可选，留空跳过）"},
-	} {
-		s, e := w.prompt(opt.label, "")
-		if e != nil {
-			return e
-		}
-		if s != "" {
-			card[opt.key] = s
-		}
-	}
-
-	raw, err := json.Marshal(card)
-	if err != nil {
-		return err
-	}
-	defer clear(raw)
-	if err = v.Put("card", raw); err != nil {
-		return err
-	}
-	fmt.Printf("已保存支付卡（尾号 %s）\n\n", tail(number))
-	return nil
-}
-
-func (w *wizard) setupProxy(ctx context.Context, v *vault.Vault) error {
-	fmt.Println("—— 代理配置 ——")
+// setupAccounts collects one or more X identities, each bound to exactly one
+// Shadowsocks proxy.
+func (w *wizard) setupAccounts(ctx context.Context, v *vault.Vault) error {
+	fmt.Println("\n【2/5】X 账号池")
+	fmt.Println("每个账号需要一个 auth_token、ct0 和一个 Shadowsocks 代理（一个账号对应一个代理）。")
+	fmt.Println("浏览器登录 x.com 后，在开发者工具 → Application → Cookies 中复制 auth_token 与 ct0。")
+	mgr := accounts.NewManager(ctx)
+	defer mgr.Close()
+	var list []accounts.Account
 	for {
-		fmt.Println("  1) 直连（direct，不使用代理）")
-		fmt.Println("  2) AnyTLS 节点（引导填写）")
-		fmt.Println("  3) 粘贴 sing-box outbound JSON")
-		choice, err := w.prompt("请选择", "1")
+		label, err := w.prompt(fmt.Sprintf("账号 %d 名称", len(list)+1), fmt.Sprintf("账号%d", len(list)+1))
 		if err != nil {
 			return err
 		}
-		var config []byte
-		switch choice {
-		case "1":
-			config = []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
-		case "2":
-			config, err = w.anyTLSConfig()
-		case "3":
-			config, err = w.pastedProxyConfig()
-		default:
-			fmt.Println("请输入 1、2 或 3。")
+		auth, err := w.secret("auth_token")
+		if err != nil {
+			return err
+		}
+		ct0, err := w.secret("ct0")
+		if err != nil {
+			return err
+		}
+		server, err := w.prompt("Shadowsocks 服务器地址（IP 或域名）", "")
+		if err != nil {
+			return err
+		}
+		portText, err := w.prompt("Shadowsocks 端口", "8388")
+		if err != nil {
+			return err
+		}
+		port := 0
+		if _, err = fmt.Sscanf(portText, "%d", &port); err != nil || port < 1 || port > 65535 {
+			return errors.New("端口必须是 1..65535")
+		}
+		method, err := w.prompt("加密方式", "aes-256-gcm")
+		if err != nil {
+			return err
+		}
+		password, err := w.secret("代理密码")
+		if err != nil {
+			return err
+		}
+		account := accounts.Account{Label: strings.TrimSpace(label), AuthToken: strings.TrimSpace(auth), CT0: strings.TrimSpace(ct0), Enabled: true, Proxy: accounts.Proxy{Type: "shadowsocks", Server: strings.TrimSpace(server), ServerPort: port, Method: strings.TrimSpace(method), Password: password}}
+		if err = account.Validate(); err != nil {
+			fmt.Printf("配置无效：%v，请重新输入。\n", err)
 			continue
 		}
-		if err != nil {
-			return err
-		}
-		defer clear(config)
-
-		port, err := ephemeralPort()
-		if err != nil {
-			return err
-		}
-		instance, err := proxy.Start(ctx, config, port)
-		if err != nil {
-			fmt.Printf("代理配置无效：%v，请重新选择。\n", err)
-			continue
-		}
-		fmt.Println("代理配置有效。")
-		test, err := w.yesNo("是否进行连通性测试（通过代理访问 https://x.com）？", false)
-		if err != nil {
-			instance.Close()
-			return err
-		}
-		if test {
-			if err = proxy.Check(ctx, port); err != nil {
-				fmt.Printf("连通性测试失败：%v（将保留该配置；若在其他网络环境配置可忽略）\n", err)
-			}
-		}
-		if err = instance.Close(); err != nil {
-			return err
-		}
-		if err = v.Put("proxy", config); err != nil {
-			return err
-		}
-		fmt.Println("已保存代理配置。")
-		fmt.Println()
-		return nil
-	}
-}
-
-func (w *wizard) anyTLSConfig() ([]byte, error) {
-	host, err := w.prompt("服务器地址", "")
-	if err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(host) == "" {
-		return nil, errors.New("服务器地址不能为空")
-	}
-	portStr, err := w.prompt("服务器端口（1-65535）", "443")
-	if err != nil {
-		return nil, err
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, errors.New("端口必须是 1-65535")
-	}
-	password, err := w.secret("AnyTLS 密码")
-	if err != nil {
-		return nil, err
-	}
-	if password == "" {
-		return nil, errors.New("密码不能为空")
-	}
-	sni, err := w.prompt("TLS SNI", host)
-	if err != nil {
-		return nil, err
-	}
-	insecure, err := w.yesNo("跳过 TLS 证书校验？", false)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(map[string]any{"outbounds": []map[string]any{{
-		"type":        "anytls",
-		"tag":         "proxy",
-		"server":      host,
-		"server_port": port,
-		"password":    password,
-		"tls":         map[string]any{"enabled": true, "server_name": sni, "insecure": insecure},
-	}}})
-}
-
-// pastedProxyConfig reads pasted JSON until a blank line, accepting either a
-// single outbound object or a full config with an outbounds array.
-func (w *wizard) pastedProxyConfig() ([]byte, error) {
-	for {
-		fmt.Println("请粘贴 JSON（单个 outbound 对象或完整配置；空行结束）：")
-		var b strings.Builder
-		for {
-			s, err := w.line()
+		fmt.Print("正在测试代理连通性… ")
+		checkCtx, cancel := context.WithTimeout(ctx, 30*1e9)
+		checkErr := mgr.Check(checkCtx, account)
+		cancel()
+		if checkErr != nil {
+			fmt.Printf("失败：%v\n", checkErr)
+			retry, err := w.yesNo("仍然保存该账号（可稍后在后台修改）", false)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			if s == "" {
-				break
+			if !retry {
+				continue
 			}
-			b.WriteString(s)
-			b.WriteByte('\n')
+		} else {
+			fmt.Println("成功")
 		}
-		raw := []byte(strings.TrimSpace(b.String()))
-		var obj map[string]any
-		if len(raw) == 0 || json.Unmarshal(raw, &obj) != nil {
-			fmt.Println("JSON 无效，请重新粘贴。")
-			continue
+		list = append(list, account)
+		more, err := w.yesNo("继续添加下一个 X 账号", false)
+		if err != nil {
+			return err
 		}
-		if outbounds, ok := obj["outbounds"].([]any); ok && len(outbounds) > 0 {
-			return raw, nil
+		if !more {
+			break
 		}
-		if obj["type"] != nil && obj["tag"] != nil {
-			wrapped, err := json.Marshal(map[string]any{"outbounds": []any{obj}})
-			if err != nil {
-				return nil, err
-			}
-			return wrapped, nil
-		}
-		fmt.Println("需为含 outbounds 数组的完整配置，或含 type 与 tag 的单个 outbound 对象，请重新粘贴。")
 	}
+	if len(list) == 0 {
+		return errors.New("至少需要一个 X 账号")
+	}
+	return accounts.Save(v, list)
 }
 
 func (w *wizard) setupStripeKey(v *vault.Vault) error {
-	fmt.Println("—— Stripe 公钥 ——")
-	fmt.Println("这是 X 结账页面使用的 Stripe 公钥（商户侧，pk_live_ 开头），不是用户的 secret key。")
-	key, err := w.secret("Stripe publishable key（pk_live_...）")
-	if err != nil {
-		return err
-	}
-	if !stripeKeyPattern.MatchString(key) {
-		return errors.New("Stripe 公钥格式无效（须匹配 pk_live_ 加字母数字）")
-	}
-	if err = v.Put("stripe-key", []byte(key)); err != nil {
-		return err
-	}
-	fmt.Printf("已保存 Stripe 公钥（尾号 %s）\n\n", tail(key))
-	return nil
-}
-
-// majorToMinor converts a major-unit amount like "300" or "4.99" to minor units.
-func majorToMinor(s string) (int, error) {
-	if !regexp.MustCompile(`^[0-9]+(\.[0-9]{1,2})?$`).MatchString(s) {
-		return 0, errors.New("金额必须是数字，最多两位小数")
-	}
-	whole, frac, _ := strings.Cut(s, ".")
-	minor, err := strconv.Atoi(whole)
-	if err != nil {
-		return 0, errors.New("金额超出范围")
-	}
-	minor *= 100
-	if frac != "" {
-		if len(frac) == 1 {
-			frac += "0"
+	fmt.Println("\n【3/5】Stripe 公钥")
+	fmt.Println("填写 X 结账页使用的 pk_live_ 公钥。")
+	for {
+		key, err := w.prompt("Stripe 公钥", "")
+		if err != nil {
+			return err
 		}
-		cents, _ := strconv.Atoi(frac)
-		minor += cents
+		key = strings.TrimSpace(key)
+		if checkout.ValidStripeKey(key) {
+			return v.Put("stripe-key", []byte(key))
+		}
+		fmt.Println("格式不正确，应以 pk_live_ 开头。")
 	}
-	return minor, nil
 }
 
 func (w *wizard) setupCatalog(v *vault.Vault) error {
-	fmt.Println("—— 商品目录 ——")
-	fmt.Println("目录记录商户、币种与允许购买的套餐（时长、金额、商品 ID），金额最终以最小货币单位保存。")
-	useDefault, err := w.yesNo("使用 X Premium 默认目录？", true)
+	fmt.Println("\n【4/5】套餐目录")
+	useDefault, err := w.yesNo("使用 X Premium 默认目录（3/6 个月）", true)
 	if err != nil {
 		return err
 	}
 	var catalog checkout.Catalog
 	if useDefault {
-		catalog = checkout.Catalog{Merchant: defaultXMerchant, Currency: defaultXCurrency, Plans: []checkout.CatalogPlan{
-			{Months: 3, Amount: 30000, Product: defaultXProduct3Mo},
-			{Months: 6, Amount: 60000, Product: defaultXProduct6Mo},
-		}}
+		catalog = checkout.DefaultCatalog()
 	} else {
 		catalog, err = w.customCatalog()
 		if err != nil {
 			return err
 		}
 	}
-	raw, err := json.Marshal(catalog)
-	if err != nil {
+	data, _ := json.Marshal(catalog)
+	defer clear(data)
+	if _, err = checkout.ParseCatalog(data); err != nil {
 		return err
 	}
-	defer clear(raw)
-	if _, err = checkout.ParseCatalog(raw); err != nil {
-		return err
-	}
-	if err = v.Put("catalog", raw); err != nil {
-		return err
-	}
-	fmt.Printf("已保存商品目录（%d 个套餐，币种 %s）\n\n", len(catalog.Plans), strings.ToUpper(catalog.Currency))
-	return nil
+	return v.Put("catalog", data)
 }
 
 func (w *wizard) customCatalog() (checkout.Catalog, error) {
-	var catalog checkout.Catalog
-	merchant, err := w.prompt("Stripe 商户账号（acct_...）", "")
+	merchant, err := w.prompt("Stripe 商户号（acct_ 开头）", checkout.DefaultXMerchant)
 	if err != nil {
-		return catalog, err
+		return checkout.Catalog{}, err
 	}
-	catalog.Merchant = merchant
-	currency, err := w.prompt("币种（三位小写字母，如 bdt）", "")
+	currency, err := w.prompt("币种（三位小写代码）", checkout.DefaultXCurrency)
 	if err != nil {
-		return catalog, err
+		return checkout.Catalog{}, err
 	}
-	catalog.Currency = currency
-	countStr, err := w.prompt("套餐数量（1-2）", "1")
-	if err != nil {
-		return catalog, err
-	}
-	count, err := strconv.Atoi(countStr)
-	if err != nil || count < 1 || count > 2 {
-		return catalog, errors.New("套餐数量必须是 1 或 2")
-	}
-	for i := 1; i <= count; i++ {
-		monthsStr, err := w.prompt(fmt.Sprintf("套餐 %d 时长（月，1-24）", i), "")
+	catalog := checkout.Catalog{Merchant: strings.TrimSpace(merchant), Currency: strings.ToLower(strings.TrimSpace(currency))}
+	for {
+		monthsText, err := w.prompt(fmt.Sprintf("第 %d 个套餐的月数（回车结束）", len(catalog.Plans)+1), "")
 		if err != nil {
-			return catalog, err
+			return checkout.Catalog{}, err
 		}
-		months, err := strconv.Atoi(monthsStr)
+		if monthsText == "" {
+			break
+		}
+		months := 0
+		if _, err = fmt.Sscanf(monthsText, "%d", &months); err != nil {
+			return checkout.Catalog{}, errors.New("月数必须是数字")
+		}
+		amountText, err := w.prompt("金额（最小货币单位，例如 259900 表示 2599.00）", "")
 		if err != nil {
-			return catalog, errors.New("时长必须是整数月数")
+			return checkout.Catalog{}, err
 		}
-		amountStr, err := w.prompt(fmt.Sprintf("套餐 %d 金额（%s，如 300 或 4.99）", i, strings.ToUpper(currency)), "")
+		amount := 0
+		if _, err = fmt.Sscanf(amountText, "%d", &amount); err != nil {
+			return checkout.Catalog{}, errors.New("金额必须是整数")
+		}
+		product, err := w.prompt("X 商品 ID（prod_ 开头）", "")
 		if err != nil {
-			return catalog, err
+			return checkout.Catalog{}, err
 		}
-		minor, err := majorToMinor(amountStr)
-		if err != nil {
-			return catalog, err
+		catalog.Plans = append(catalog.Plans, checkout.CatalogPlan{Months: months, Amount: amount, Product: strings.TrimSpace(product)})
+		if len(catalog.Plans) == 2 {
+			break
 		}
-		product, err := w.prompt(fmt.Sprintf("套餐 %d Stripe 商品 ID（prod_...）", i), "")
-		if err != nil {
-			return catalog, err
-		}
-		catalog.Plans = append(catalog.Plans, checkout.CatalogPlan{Months: months, Amount: minor, Product: product})
 	}
 	return catalog, nil
 }
 
-func (w *wizard) setupSite(db, passwordFile string) (bool, error) {
-	fmt.Println("—— 站点配置（可选）——")
-	generate, err := w.yesNo("是否生成站点配置文件？", false)
+func (w *wizard) setupSite(dir, passwordPath string) error {
+	fmt.Println("\n【5/5】站点配置")
+	origin, err := w.prompt("站点完整域名（https:// 开头）", "https://example.com")
 	if err != nil {
-		return false, err
+		return err
 	}
-	if !generate {
-		return false, nil
+	if !strings.HasPrefix(origin, "https://") {
+		return errors.New("域名必须以 https:// 开头")
 	}
-	origin, err := w.prompt("站点 Origin（https://<主机名>）", "")
-	if err != nil {
-		return false, err
-	}
-	u, err := url.Parse(origin)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-		return false, errors.New("Origin 必须是 https://<主机名> 形式（不带路径、查询或用户信息）")
-	}
-	listen, err := w.prompt("监听地址", "127.0.0.1:8787")
-	if err != nil {
-		return false, err
-	}
-	host, _, err := net.SplitHostPort(listen)
-	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
-		return false, errors.New("监听地址必须使用回环 IP（如 127.0.0.1:8787）")
-	}
-	payments, err := w.yesNo("是否开启支付？", false)
-	if err != nil {
-		return false, err
-	}
-
 	admin := make([]byte, 24)
 	if _, err = rand.Read(admin); err != nil {
-		return false, err
+		return err
 	}
 	adminPassword := base64.RawURLEncoding.EncodeToString(admin)
-	clear(admin)
-	dir := filepath.Dir(db)
 	adminPath := filepath.Join(dir, "admin-password")
 	if err = writeOwnerOnly(adminPath, []byte(adminPassword+"\n")); err != nil {
-		return false, err
+		return fmt.Errorf("管理员密码文件无法写入（可能已存在）: %w", err)
 	}
-	enabled := "false"
-	if payments {
-		enabled = "true"
-	}
-	siteEnv := fmt.Sprintf("XGIFT_ORIGIN=%s\nXGIFT_LISTEN=%s\nXGIFT_DATA_DIR=%s\nXGIFT_PASSWORD_FILE=%s\nXGIFT_ADMIN_PASSWORD_FILE=%s\nXGIFT_PAYMENTS_ENABLED=%s\n",
-		origin, listen, dir, passwordFile, adminPath, enabled)
+	env := fmt.Sprintf("XGIFT_ORIGIN=%s\nXGIFT_LISTEN=127.0.0.1:8787\nXGIFT_DATA_DIR=%s\nXGIFT_PASSWORD_FILE=%s\nXGIFT_ADMIN_PASSWORD_FILE=%s\nXGIFT_PAYMENTS_ENABLED=true\n", origin, dir, passwordPath, adminPath)
 	envPath := filepath.Join(dir, "site.env")
-	if err = writeOwnerOnly(envPath, []byte(siteEnv)); err != nil {
-		return false, err
+	if err = writeOwnerOnly(envPath, []byte(env)); err != nil {
+		return fmt.Errorf("站点配置无法写入（可能已存在）: %w", err)
 	}
-	fmt.Printf("站点配置已生成：%s（0600）\n", envPath)
-	fmt.Printf("后台管理员密码（仅此一次显示，亦保存于 %s）：%s\n", adminPath, adminPassword)
-	fmt.Println("生产部署请参照 deploy/ 模板，将 site.env 与密钥移至 /etc/xgift/ 并保持仅属主可读。")
-	fmt.Println()
-	return true, nil
+	fmt.Printf("\n配置完成。\n站点配置：%s\n管理员密码文件：%s（管理员用户名 admin）\n", envPath, adminPath)
+	fmt.Println("下一步：运行 xgift status 校验全部记录，然后启动 xgift-web。")
+	return nil
 }

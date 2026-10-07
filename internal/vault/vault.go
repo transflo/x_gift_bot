@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/scrypt"
@@ -93,7 +94,7 @@ func Open(path, passwordFile string, create bool) (*Vault, error) {
 	}()
 	var salt []byte
 	if create {
-		_, err = db.Exec(`CREATE TABLE metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL); CREATE TABLE secrets (name TEXT PRIMARY KEY, payload BLOB NOT NULL);`)
+		_, err = db.Exec(`CREATE TABLE metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL); CREATE TABLE secrets (name TEXT PRIMARY KEY, payload BLOB NOT NULL, created INTEGER NOT NULL DEFAULT 0);`)
 		if err != nil {
 			return nil, err
 		}
@@ -107,6 +108,9 @@ func Open(path, passwordFile string, create bool) (*Vault, error) {
 		}
 	} else {
 		if err = db.QueryRow("SELECT value FROM metadata WHERE key='salt'").Scan(&salt); err != nil {
+			return nil, err
+		}
+		if err = migrateSecrets(db); err != nil {
 			return nil, err
 		}
 	}
@@ -149,7 +153,7 @@ func (v *Vault) Put(name string, plain []byte) error {
 		return err
 	}
 	encrypted := v.aead.Seal(nonce, nonce, plain, []byte("xgift-v1:"+name))
-	_, err := v.db.Exec("INSERT INTO secrets(name,payload) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload", name, encrypted)
+	_, err := v.db.Exec("INSERT INTO secrets(name,payload,created) VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload", name, encrypted, time.Now().Unix())
 	return err
 }
 func (v *Vault) Get(name string) ([]byte, error) {
@@ -171,7 +175,7 @@ func (v *Vault) PutIfAbsent(name string, plain []byte) (bool, error) {
 		return false, err
 	}
 	encrypted := v.aead.Seal(nonce, nonce, plain, []byte("xgift-v1:"+name))
-	result, err := v.db.Exec("INSERT INTO secrets(name,payload) VALUES (?,?) ON CONFLICT(name) DO NOTHING", name, encrypted)
+	result, err := v.db.Exec("INSERT INTO secrets(name,payload,created) VALUES (?,?,?) ON CONFLICT(name) DO NOTHING", name, encrypted, time.Now().Unix())
 	if err != nil {
 		return false, err
 	}
@@ -179,6 +183,106 @@ func (v *Vault) PutIfAbsent(name string, plain []byte) (bool, error) {
 	return n == 1, err
 }
 func (v *Vault) Close() error { return v.db.Close() }
+
+// migrateSecrets adds the record timestamp to a vault created before retention
+// existed. Existing rows are stamped with the upgrade time rather than zero, so
+// an upgrade can never delete records the operator has not had a chance to age
+// out under the new policy.
+func migrateSecrets(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(secrets)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, required, primary int
+		var name, typ string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &typ, &required, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "created" {
+			found = true
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if found {
+		return nil
+	}
+	if _, err = db.Exec("ALTER TABLE secrets ADD COLUMN created INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	_, err = db.Exec("UPDATE secrets SET created=? WHERE created=0", time.Now().Unix())
+	return err
+}
+
+// PrunePrefixes deletes records under the given name prefixes that were written
+// before the cutoff. It reports how many rows were removed. A prefix must end in
+// a separator so "checkout-verification:" can never match "checkout-verificationx".
+func (v *Vault) PrunePrefixes(cutoff int64, prefixes ...string) (int, error) {
+	removed := 0
+	for _, prefix := range prefixes {
+		if !strings.HasSuffix(prefix, ":") {
+			return removed, errors.New("prune prefix must end in a colon")
+		}
+		result, err := v.db.Exec("DELETE FROM secrets WHERE name >= ? AND name < ? AND created > 0 AND created < ?", prefix, prefix+"\xff", cutoff)
+		if err != nil {
+			return removed, err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return removed, err
+		}
+		removed += int(n)
+	}
+	return removed, nil
+}
+
+// CountPrefixes reports record counts and approximate encrypted payload bytes
+// per prefix, so the admin UI can show what is actually taking up space.
+func (v *Vault) CountPrefixes(prefixes ...string) (map[string]PrefixUsage, error) {
+	out := make(map[string]PrefixUsage, len(prefixes))
+	for _, prefix := range prefixes {
+		var usage PrefixUsage
+		err := v.db.QueryRow("SELECT COUNT(*),COALESCE(SUM(LENGTH(payload)),0) FROM secrets WHERE name >= ? AND name < ?", prefix, prefix+"\xff").Scan(&usage.Records, &usage.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		out[prefix] = usage
+	}
+	return out, nil
+}
+
+// PrefixUsage is one bucket of the storage report.
+type PrefixUsage struct {
+	Records int   `json:"records"`
+	Bytes   int64 `json:"bytes"`
+}
+
+// Compact reclaims space after pruning. VACUUM rewrites the whole file, so it
+// only runs once the freelist is a meaningful share of the database.
+func (v *Vault) Compact() (bool, error) {
+	var freelist, pageCount, pageSize int64
+	if err := v.db.QueryRow("PRAGMA freelist_count").Scan(&freelist); err != nil {
+		return false, err
+	}
+	if err := v.db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return false, err
+	}
+	if err := v.db.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		return false, err
+	}
+	if pageCount == 0 || freelist*4 < pageCount || freelist*pageSize < 4<<20 {
+		return false, nil
+	}
+	_, err := v.db.Exec("VACUUM")
+	return err == nil, err
+}
 
 // Archive atomically preserves an authenticated record under a new name and removes
 // its active key, only if its contents still match the verified snapshot.
@@ -209,7 +313,7 @@ func (v *Vault) Archive(name, archive string, expected, archived []byte) error {
 		return err
 	}
 	encrypted := v.aead.Seal(nonce, nonce, archived, []byte("xgift-v1:"+archive))
-	if _, err = tx.Exec("INSERT INTO secrets(name,payload) VALUES (?,?)", archive, encrypted); err != nil {
+	if _, err = tx.Exec("INSERT INTO secrets(name,payload,created) VALUES (?,?,?)", archive, encrypted, time.Now().Unix()); err != nil {
 		return err
 	}
 	if _, err = tx.Exec("DELETE FROM secrets WHERE name=?", name); err != nil {
@@ -257,7 +361,7 @@ func (v *Vault) ReplaceArchived(name, archive string, expected, proof, replaceme
 	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec("INSERT INTO secrets(name,payload) VALUES (?,?)", archive, saved); err != nil {
+	if _, err = tx.Exec("INSERT INTO secrets(name,payload,created) VALUES (?,?,?)", archive, saved, time.Now().Unix()); err != nil {
 		return err
 	}
 	if _, err = tx.Exec("UPDATE secrets SET payload=? WHERE name=?", next, name); err != nil {

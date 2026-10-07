@@ -1,25 +1,21 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"syscall"
 
+	"xgift/internal/accounts"
 	"xgift/internal/checkout"
-	"xgift/internal/chrome"
-	"xgift/internal/proxy"
 	"xgift/internal/vault"
 )
 
@@ -31,16 +27,15 @@ func main() {
 }
 
 func run() error {
-	// Permit the requested `xgift username --pay` spelling as well as global flags.
 	args := os.Args[1:]
 	command := ""
-	sub := ""
+	positional := []string{}
 	rest := []string{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
 			rest = append(rest, a)
-			if a == "--db" || a == "--password-file" || a == "--profile" || a == "--port" || a == "--name" || a == "--months" || a == "--last4" {
+			if a == "--db" || a == "--password-file" || a == "--name" || a == "--months" || a == "--id" || a == "--label" {
 				i++
 				if i >= len(args) {
 					return errors.New("missing flag value")
@@ -49,10 +44,8 @@ func run() error {
 			}
 		} else if command == "" {
 			command = a
-		} else if command == "cards" && sub == "" {
-			sub = a
 		} else {
-			return errors.New("unexpected argument")
+			positional = append(positional, a)
 		}
 	}
 	f := flag.NewFlagSet("xgift", flag.ContinueOnError)
@@ -67,16 +60,12 @@ func run() error {
 	}
 	db := f.String("db", defaultDB, "encrypted SQLite record store")
 	key := f.String("password-file", os.Getenv("XGIFT_PASSWORD_FILE"), "owner-only password file")
-	profile := f.String("profile", "Default", "Chrome directory name")
-	port := f.Int("port", 0, "local proxy port; default automatic (proxy command: 18791)")
 	months := f.Int("months", 6, "gift duration in months; must match a plan in the catalog record")
-	last4 := f.String("last4", "", "card tail for cards remove")
-	retire := f.Bool("retire-canceled", false, "archive an inactive, canceled, unpaid order after read-only verification")
-	inspect := f.Bool("inspect", false, "read the existing Stripe order status without paying")
-	pay := f.Bool("pay", false, "pay only at the exact catalog plan total")
 	name := f.String("name", "", "secret name for put")
+	id := f.String("id", "", "account id for accounts commands")
+	label := f.String("label", "", "account label when adding")
 	f.Usage = func() {
-		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|billing|cards|import-chrome|put|proxy|check|check-payment-outbounds|resume-payments|username> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put reads one JSON value from stdin (stripe-key: the raw pk_live_ key; catalog: merchant/plan catalog JSON; payment-outbounds: an outbound array; cards: a card array). cards list|add|remove|unblock|rotate manages the encrypted payment card pool. check-payment-outbounds probes public endpoints without paying.")
+		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|put|accounts|check|link> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put writes one encrypted record (--name accounts|api-auth|stripe-key|catalog). accounts list|add|remove|enable|disable|test manages the X account pool and its Shadowsocks proxies. link creates or reuses a Stripe payment link for one X username.")
 		f.PrintDefaults()
 	}
 	if err := f.Parse(rest); err != nil {
@@ -88,9 +77,6 @@ func run() error {
 	if command == "" {
 		f.Usage()
 		return nil
-	}
-	if *port != 0 && (*port < 1024 || *port > 65535) {
-		return errors.New("port must be 1024..65535")
 	}
 	if command == "setup" {
 		return runSetup(context.Background(), *db, *key)
@@ -126,11 +112,22 @@ func run() error {
 			if n == "vault-check" {
 				return errors.New("reserved secret name")
 			}
+			// A JSON string secret (for example the Stripe key) is stored as its
+			// decoded value; structured records keep their JSON form.
+			if len(b) > 0 && b[0] == '"' {
+				var s string
+				if err = json.Unmarshal(b, &s); err != nil {
+					return fmt.Errorf("record %s: invalid JSON string", n)
+				}
+				b = []byte(s)
+			}
+			if err = validateRecord(n, b); err != nil {
+				return fmt.Errorf("record %s: %w", n, err)
+			}
 			if err = v.Put(n, b); err != nil {
 				return err
 			}
 		}
-		// Save only the password's path, never the password, next to the vault.
 		if err = os.WriteFile(filepath.Join(filepath.Dir(*db), "password-path"), []byte(*key+"\n"), 0600); err != nil {
 			return err
 		}
@@ -149,318 +146,273 @@ func run() error {
 		return err
 	}
 	defer v.Close()
+
 	switch command {
-	case "cards":
-		return runCards(v, sub, *last4)
-	case "check-payment-outbounds":
-		failed := false
-		enc := json.NewEncoder(os.Stdout)
-		if err := checkout.ProbePaymentOutbounds(context.Background(), v, func(result checkout.PaymentNodeProbe) {
-			enc.Encode(result)
-			if !result.Healthy {
-				failed = true
-			}
-		}); err != nil {
-			return err
+	case "accounts":
+		sub := ""
+		if len(positional) > 0 {
+			sub = positional[0]
 		}
-		if failed {
-			return errors.New("one or more payment outbounds could not reach Stripe; no payment submitted")
-		}
-		return nil
-	case "resume-payments":
-		lock, e := os.OpenFile(filepath.Join(filepath.Dir(*db), "checkout.lock"), os.O_CREATE|os.O_RDWR, 0600)
-		if e != nil {
-			return e
-		}
-		defer lock.Close()
-		if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
-			return errors.New("another checkout is running")
-		}
-		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-		if e = checkout.ResetManualPaymentPause(v); e != nil {
-			return e
-		}
-		fmt.Println("Automatic payment pause cleared; payment spacing remains enforced.")
-		return nil
-	case "billing":
-		var fields map[string]string
-		if e := json.NewDecoder(io.LimitReader(os.Stdin, 65536)).Decode(&fields); e != nil {
-			return errors.New("billing expects a JSON object on stdin")
-		}
-		n, e := checkout.UpdateCardBilling(v, fields)
-		if e != nil {
-			return e
-		}
-		fmt.Printf("Billing information saved in encrypted SQLite for %d card(s)\n", n)
-		return nil
+		return runAccounts(v, sub, *id, *label)
+	case "check":
+		return runCheck(v)
 	case "status":
-		for _, n := range []string{"cookies", "proxy"} {
-			b, e := v.Get(n)
-			if e != nil {
-				return fmt.Errorf("record %s is missing; run setup or put --name %s", n, n)
-			}
-			if !json.Valid(b) {
-				return fmt.Errorf("invalid %s JSON", n)
-			}
-			clear(b)
-			fmt.Printf("%s: encrypted record verified\n", n)
-		}
-		status, e := checkout.CardsStatus(v)
-		if e != nil {
-			return e
-		}
-		usable := 0
-		for _, card := range status {
-			if card.Usable {
-				usable++
-			}
-		}
-		if usable == 0 {
-			return checkout.ErrNoUsableCard
-		}
-		fmt.Printf("cards: %d encrypted record(s), %d usable\n", len(status), usable)
-		raw, e := v.Get("api-auth")
-		if e != nil {
-			return errors.New("record api-auth is missing; fix with put --name api-auth")
-		}
-		var auth struct{ Authorization string }
-		if e = json.Unmarshal(raw, &auth); e != nil || !strings.HasPrefix(auth.Authorization, "Bearer ") {
-			clear(raw)
-			return errors.New("invalid api-auth record; rewrite with put --name api-auth")
-		}
-		clear(raw)
-		fmt.Println("api-auth: encrypted record verified")
-		key, e := v.Get("stripe-key")
-		if e != nil {
-			return errors.New("record stripe-key is missing; fix with put --name stripe-key")
-		}
-		if !stripeKeyPattern.Match(key) {
-			clear(key)
-			return errors.New("invalid stripe-key record; rewrite with put --name stripe-key")
-		}
-		clear(key)
-		fmt.Println("stripe-key: encrypted record verified")
-		if _, e = checkout.ReadCatalog(v); e != nil {
-			return e
-		}
-		fmt.Println("catalog: encrypted record verified")
-		return nil
-	case "import-chrome":
-		b, e := chrome.Extract(*profile)
-		if e != nil {
-			return e
-		}
-		defer clear(b)
-		if e = v.Put("cookies", b); e != nil {
-			return e
-		}
-		fmt.Println("X cookies refreshed in encrypted SQLite vault")
-		return nil
+		return runStatus(v)
 	case "put":
-		switch *name {
-		case "payment-outbounds":
-			b, e := io.ReadAll(io.LimitReader(os.Stdin, (1<<20)+1))
-			if e != nil {
-				return e
-			}
-			defer clear(b)
-			nodes, e := proxy.ParseOutboundPool(b)
-			if e != nil {
-				return e
-			}
-			// Updating the pool never edits existing per-order node bindings.
-			if e = v.Put(*name, b); e != nil {
-				return e
-			}
-			fmt.Printf("Payment outbound pool saved: %d nodes; existing order bindings retained\n", len(nodes))
-			return nil
-		case "proxy", "card", "cookies", "api-auth":
-			b, e := io.ReadAll(io.LimitReader(os.Stdin, 1024*1024))
-			if e != nil {
-				return e
-			}
-			defer clear(b)
-			if !json.Valid(b) {
-				return errors.New("stdin must be valid JSON")
-			}
-			return v.Put(*name, b)
-		case "cards":
-			b, e := io.ReadAll(io.LimitReader(os.Stdin, 1024*1024))
-			if e != nil {
-				return e
-			}
-			defer clear(b)
-			n, e := checkout.SetCardRecords(v, b)
-			if e != nil {
-				return e
-			}
-			fmt.Printf("Card set replaced: %d validated cards\n", n)
-			return nil
-		case "stripe-key":
-			b, e := io.ReadAll(io.LimitReader(os.Stdin, 4096))
-			if e != nil {
-				return e
-			}
-			defer clear(b)
-			b = bytes.TrimSpace(b)
-			if !stripeKeyPattern.Match(b) {
-				return errors.New("stdin must be the pk_live_ publishable key")
-			}
-			return v.Put(*name, b)
-		case "catalog":
-			b, e := io.ReadAll(io.LimitReader(os.Stdin, 65536))
-			if e != nil {
-				return e
-			}
-			defer clear(b)
-			if _, e = checkout.ParseCatalog(b); e != nil {
-				return e
-			}
-			return v.Put(*name, b)
-		default:
-			return errors.New("--name must be proxy, payment-outbounds, card, cards, cookies, api-auth, stripe-key or catalog")
+		return runPut(v, *name)
+	case "link":
+		if len(positional) != 1 || !regexp.MustCompile(`^@?[A-Za-z0-9_]{1,15}$`).MatchString(positional[0]) {
+			return errors.New("link expects an X username")
+		}
+		return runLink(v, *db, positional[0], *months)
+	default:
+		return errors.New("unknown command; run xgift for usage")
+	}
+}
+
+func validateRecord(name string, b []byte) error {
+	switch name {
+	case "accounts":
+		_, err := accounts.Parse(b)
+		return err
+	case "api-auth":
+		var auth struct{ Authorization string }
+		if json.Unmarshal(b, &auth) != nil || !strings.HasPrefix(auth.Authorization, "Bearer ") {
+			return errors.New("api-auth must be {\"Authorization\":\"Bearer ...\",\"UserAgent\":\"...\"}")
+		}
+		return nil
+	case "stripe-key":
+		if !checkout.ValidStripeKey(string(b)) {
+			return errors.New("stdin must be the pk_live_ publishable key")
+		}
+		return nil
+	case "catalog":
+		_, err := checkout.ParseCatalog(b)
+		return err
+	default:
+		return errors.New("unsupported record name")
+	}
+}
+
+func runStatus(v *vault.Vault) error {
+	list, err := accounts.Load(v)
+	if err != nil {
+		return err
+	}
+	enabled := 0
+	for _, a := range list {
+		if a.Enabled {
+			enabled++
 		}
 	}
-	if command != "proxy" && command != "check" && !regexp.MustCompile(`^@?[A-Za-z0-9_]{1,15}$`).MatchString(command) {
-		return errors.New("invalid command or X username")
+	if enabled == 0 {
+		return accounts.ErrNoEnabledAccount
 	}
-	if command != "proxy" && command != "check" {
-		lock, e := os.OpenFile(filepath.Join(filepath.Dir(*db), "checkout.lock"), os.O_CREATE|os.O_RDWR, 0600)
-		if e != nil {
-			return e
-		}
-		defer lock.Close()
-		if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
-			return errors.New("another checkout command is running")
-		}
-		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	fmt.Printf("accounts: %d encrypted record(s), %d enabled\n", len(list), enabled)
+	if _, err = v.Get("api-auth"); err != nil {
+		return errors.New("record api-auth is missing; fix with put --name api-auth")
 	}
-	if *port == 0 {
-		if command == "proxy" {
-			*port = 18791
-		} else {
-			l, e := net.Listen("tcp", "127.0.0.1:0")
-			if e != nil {
-				return e
-			}
-			_, p, _ := net.SplitHostPort(l.Addr().String())
-			*port, _ = strconv.Atoi(p)
-			l.Close()
-		}
+	fmt.Println("api-auth: encrypted record verified")
+	key, err := v.Get("stripe-key")
+	if err != nil {
+		return errors.New("record stripe-key is missing; fix with put --name stripe-key")
+	}
+	if !checkout.ValidStripeKey(string(key)) {
+		clear(key)
+		return errors.New("invalid stripe-key record; rewrite with put --name stripe-key")
+	}
+	clear(key)
+	fmt.Println("stripe-key: encrypted record verified")
+	if _, err = checkout.ReadCatalog(v); err != nil {
+		return err
+	}
+	fmt.Println("catalog: encrypted record verified")
+	return nil
+}
+
+func runCheck(v *vault.Vault) error {
+	list, err := accounts.Load(v)
+	if err != nil {
+		return err
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	config, err := v.Get("proxy")
-	if err != nil {
-		return err
-	}
-	defer clear(config)
-	instance, err := proxy.Start(ctx, config, *port)
-	if err != nil {
-		return err
-	}
-	defer instance.Close()
-	fmt.Fprintf(os.Stderr, "Embedded sing-box proxy listening on 127.0.0.1:%d\n", *port)
-	if command == "proxy" {
-		<-ctx.Done()
-		return nil
-	}
-	if command == "check" {
-		return proxy.Check(ctx, *port)
-	}
-	if *inspect {
-		return checkout.Inspect(ctx, v, command, *port, *months)
-	}
-	if *retire {
-		if *pay {
-			return errors.New("--retire-canceled cannot be combined with --pay")
+	mgr := accounts.NewManager(ctx)
+	defer mgr.Close()
+	failed := false
+	for _, a := range list {
+		if !a.Enabled {
+			continue
 		}
-		return checkout.RetireCanceled(ctx, v, command, *port, *months)
-	}
-	result, e := checkout.Run(ctx, v, command, *pay, *port, *months)
-	if result != nil {
-		if e == nil || result.Status == "requires_action" || result.Status == "unknown" || result.Status == "submitting" {
-			fmt.Println(result.URL)
+		fmt.Printf("%s … ", accounts.Redact(a))
+		checkCtx, stop := context.WithCancel(ctx)
+		checkErr := mgr.Check(checkCtx, a)
+		stop()
+		if checkErr != nil {
+			fmt.Printf("失败：%v\n", checkErr)
+			failed = true
+			continue
 		}
-		fmt.Fprintln(os.Stderr, "Checkout status:", result.Status)
+		fmt.Println("可访问 X")
 	}
-	return e
+	if failed {
+		return errors.New("one or more accounts could not reach X through their proxy")
+	}
+	return nil
 }
 
-func runCards(v *vault.Vault, sub, last4 string) error {
+func runAccounts(v *vault.Vault, sub, id, label string) error {
+	list, err := accounts.Load(v)
+	if err != nil {
+		list = []accounts.Account{}
+	}
 	switch sub {
 	case "", "list":
-		status, err := checkout.CardsStatus(v)
-		if err != nil {
-			return err
+		for i, a := range list {
+			state := "启用"
+			if !a.Enabled {
+				state = "停用"
+			}
+			fmt.Printf("%d) %s [%s] %s → %s:%d (%s)\n", i+1, a.ID, state, a.Label, a.Proxy.Server, a.Proxy.ServerPort, a.Proxy.Method)
 		}
-		rotation, err := checkout.PaymentRotationStatus(v)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("卡池：%d 张（每 %d 个连续订单使用同一卡+节点组合；被拒后立即轮换）\n", rotation.Cards, rotation.BatchSize)
-		for i, s := range status {
-			line := fmt.Sprintf("  %d) 尾号 %s", i+1, s.Last4)
-			if s.Usable {
-				line += " 可用"
-			} else {
-				line += " 不可用：" + s.Problem
-			}
-			if s.Blocked != "" {
-				if s.CoolingSeconds > 0 {
-					line += fmt.Sprintf("（整卡冷却：%s，剩 %d 分钟）", s.Blocked, (s.CoolingSeconds+59)/60)
-				} else {
-					line += "（已封锁：" + s.Blocked + "）"
-				}
-			}
-			if s.PairCooling > 0 {
-				line += fmt.Sprintf("（%d 组卡+节点组合冷却中）", s.PairCooling)
-			}
-			fmt.Println(line)
-		}
-		if rotation.CardLast4 == "" {
-			fmt.Println("当前轮换组合：未开始（下一笔付款时随机选择）")
-		} else {
-			node := rotation.Node
-			if node == "" {
-				node = "direct"
-			}
-			fmt.Printf("当前轮换组合：尾号 %s × %s（已用 %d/%d）\n", rotation.CardLast4, node, rotation.Used, rotation.BatchSize)
+		if len(list) == 0 {
+			fmt.Println("账号池为空。")
 		}
 		return nil
 	case "add":
-		b, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, 1024*1024))
 		if err != nil {
 			return err
 		}
 		defer clear(b)
-		total, err := checkout.AddCardRecords(v, b)
+		incoming, err := accounts.Parse(b)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("卡池已保存：共 %d 张。缺少的账单字段已从现有卡继承。\n", total)
+		if strings.TrimSpace(label) != "" && len(incoming) == 1 {
+			incoming[0].Label = strings.TrimSpace(label)
+		}
+		list = append(list, incoming...)
+		if err = accounts.Save(v, list); err != nil {
+			return err
+		}
+		fmt.Printf("账号池已保存：共 %d 个账号。\n", len(list))
 		return nil
 	case "remove":
-		remaining, err := checkout.RemoveCardRecord(v, last4)
-		if err != nil {
+		if id == "" {
+			return errors.New("accounts remove requires --id")
+		}
+		next := list[:0]
+		found := false
+		for _, a := range list {
+			if a.ID == id {
+				found = true
+				continue
+			}
+			next = append(next, a)
+		}
+		if !found {
+			return errors.New("account not found")
+		}
+		if len(next) == 0 {
+			return errors.New("at least one account must remain")
+		}
+		if err = accounts.Save(v, next); err != nil {
 			return err
 		}
-		fmt.Printf("已移除尾号 %s；卡池剩余 %d 张\n", last4, remaining)
+		fmt.Printf("已删除账号 %s；账号池剩余 %d 个\n", id, len(next))
 		return nil
-	case "unblock":
-		cleared, err := checkout.UnblockPaymentCards(v)
-		if err != nil {
+	case "enable", "disable":
+		if id == "" {
+			return fmt.Errorf("accounts %s requires --id", sub)
+		}
+		found := false
+		for i := range list {
+			if list[i].ID == id {
+				list[i].Enabled = sub == "enable"
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("account not found")
+		}
+		if err = accounts.Save(v, list); err != nil {
 			return err
 		}
-		fmt.Printf("已解除 %d 张卡的封锁；若仍有可用卡，付款保护暂停已同步解除\n", cleared)
+		fmt.Printf("账号 %s 已%s\n", id, map[string]string{"enable": "启用", "disable": "停用"}[sub])
 		return nil
-	case "rotate":
-		if err := checkout.ResetPaymentRotation(v); err != nil {
-			return err
+	case "test":
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		mgr := accounts.NewManager(ctx)
+		defer mgr.Close()
+		failed := false
+		for _, a := range list {
+			if id != "" && a.ID != id {
+				continue
+			}
+			fmt.Printf("%s … ", accounts.Redact(a))
+			checkErr := mgr.Check(ctx, a)
+			if checkErr != nil {
+				fmt.Printf("失败：%v\n", checkErr)
+				failed = true
+				continue
+			}
+			fmt.Println("可访问 X")
 		}
-		fmt.Println("已结束当前轮换批次；下一笔付款将随机选择新的卡+节点组合")
+		if failed {
+			return errors.New("one or more accounts could not reach X")
+		}
 		return nil
 	default:
-		return errors.New("cards expects list, add, remove --last4 XXXX, unblock or rotate")
+		return errors.New("accounts expects list, add, remove --id, enable --id, disable --id or test [--id]")
 	}
+}
+
+func runPut(v *vault.Vault, name string) error {
+	if name == "" {
+		return errors.New("--name is required")
+	}
+	limit := int64(1024 * 1024)
+	if name == "stripe-key" {
+		limit = 4096
+	}
+	b, err := io.ReadAll(io.LimitReader(os.Stdin, limit))
+	if err != nil {
+		return err
+	}
+	defer clear(b)
+	b = []byte(strings.TrimSpace(string(b)))
+	if err = validateRecord(name, b); err != nil {
+		return err
+	}
+	if err = v.Put(name, b); err != nil {
+		return err
+	}
+	fmt.Printf("%s saved\n", name)
+	return nil
+}
+
+func runLink(v *vault.Vault, db string, user string, months int) error {
+	user = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(user), "@"))
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	lock, err := os.OpenFile(filepath.Join(filepath.Dir(db), "checkout.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errors.New("another checkout command is running")
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	mgr := accounts.NewManager(ctx)
+	defer mgr.Close()
+	record, err := checkout.CreateAdminLink(ctx, v, mgr, user, months)
+	if record != nil {
+		fmt.Println(checkout.CheckoutLink(record))
+		fmt.Fprintf(os.Stderr, "Checkout status: %s\n", record.Status)
+	}
+	return err
 }

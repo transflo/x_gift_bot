@@ -19,6 +19,50 @@ type temporaryError struct {
 func (e *temporaryError) Error() string { return e.cause.Error() }
 func (e *temporaryError) Unwrap() error { return e.cause }
 func temporary(err error) error         { return &temporaryError{cause: err} }
+
+// transportFailure marks a request that never reached X because the account's
+// proxy could not carry it.
+type transportFailure struct{ cause error }
+
+func (e *transportFailure) Error() string { return e.cause.Error() }
+func (e *transportFailure) Unwrap() error { return e.cause }
+
+// statusFailure carries the HTTP status X returned, so callers can tell an
+// account problem from an X problem.
+type statusFailure struct {
+	cause  error
+	status int
+}
+
+func (e *statusFailure) Error() string { return e.cause.Error() }
+func (e *statusFailure) Unwrap() error { return e.cause }
+
+// accountFault reports whether a failure points at one account and its proxy
+// rather than at X itself, which is what makes trying the next account in the
+// pool worthwhile:
+//
+//   - a transport failure means the Shadowsocks tunnel is down;
+//   - 401/403 means the cookie was revoked or the account is suspended;
+//   - 404 means the account stopped resolving;
+//   - 429 means that account is rate limited, and another exit IP may not be.
+//
+// A 5xx is deliberately excluded: it points at X, and the ordinary backoff
+// retry already handles it.
+func accountFault(err error) bool {
+	var transport *transportFailure
+	if errors.As(err, &transport) {
+		return true
+	}
+	var status *statusFailure
+	if errors.As(err, &status) {
+		switch status.status {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
+			return true
+		}
+	}
+	return false
+}
+
 func httpFailure(err error, status int, retryAfter string) error {
 	if status != 429 && (status < 500 || status > 599) {
 		return err

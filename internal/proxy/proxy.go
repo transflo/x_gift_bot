@@ -4,10 +4,6 @@ import (
 	"context"
 	stdjson "encoding/json"
 	"fmt"
-	"net/http"
-	"net/url"
-	"os"
-	"time"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
@@ -15,6 +11,11 @@ import (
 	"github.com/sagernet/sing/common/json"
 )
 
+// Start runs an embedded sing-box instance that exposes one loopback mixed
+// inbound and forwards all traffic through the supplied outbounds. Only
+// traffic forwarding is allowed: sections that could open listeners or alter
+// the host (API services, TUN endpoints, clash/v2ray/debug controllers) are
+// dropped.
 func Start(ctx context.Context, config []byte, port int) (*box.Box, error) {
 	ctx = include.Context(ctx)
 	var raw map[string]any
@@ -25,9 +26,6 @@ func Start(ctx context.Context, config []byte, port int) (*box.Box, error) {
 	if !ok || len(outbounds) == 0 {
 		return nil, fmt.Errorf("proxy configuration must contain at least one outbound")
 	}
-	// Only traffic forwarding is allowed: drop every section that could
-	// open listeners or alter the host (API services, TUN endpoints,
-	// clash/v2ray/debug controllers). Outbounds, route and dns pass through.
 	delete(raw, "services")
 	delete(raw, "endpoints")
 	delete(raw, "experimental")
@@ -50,19 +48,4 @@ func Start(ctx context.Context, config []byte, port int) (*box.Box, error) {
 		return nil, fmt.Errorf("start embedded sing-box: %w", err)
 	}
 	return instance, nil
-}
-
-func Check(ctx context.Context, port int) error {
-	p, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
-	tr := &http.Transport{Proxy: http.ProxyURL(p), TLSHandshakeTimeout: 15 * time.Second}
-	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, Timeout: 25 * time.Second}
-	req, _ := http.NewRequestWithContext(ctx, "HEAD", "https://x.com", nil)
-	res, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("local proxy is running, but HTTPS to X failed: %w", err)
-	}
-	defer res.Body.Close()
-	fmt.Fprintf(os.Stderr, "X HTTPS reachable, HTTP status %d\n", res.StatusCode)
-	return nil
 }
