@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 var (
@@ -24,7 +24,7 @@ func publicLinkFresh(r *Record, now time.Time) bool {
 
 // verifyPublicCheckout reads the session through Stripe and classifies its
 // state. It never tokens a card, confirms a payment or cancels anything.
-func verifyPublicCheckout(ctx context.Context, v *vault.Vault, x *xClient, r *Record, plan Plan) error {
+func verifyPublicCheckout(ctx context.Context, v *store.Store, x *xClient, r *Record, plan Plan) error {
 	s, err := x.stripe(ctx)
 	if err != nil {
 		return err

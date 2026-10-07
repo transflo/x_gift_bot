@@ -78,7 +78,7 @@ func (s *server) copyCode(w http.ResponseWriter, r *http.Request) {
 		message(w, 409, "历史兑换码未保存完整内容，无法复制。请使用之前下载的 TXT。")
 		return
 	}
-	plain, err := s.vault.Get("redemption:" + q.ID)
+	plain, err := s.records.Get("redemption:" + q.ID)
 	if err != nil || hash(string(plain)) != digest {
 		message(w, 503, "无法读取完整兑换码，请稍后重试。")
 		return

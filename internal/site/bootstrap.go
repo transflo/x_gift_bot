@@ -2,19 +2,17 @@ package site
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"xgift/internal/checkout"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 // adminSlugPattern matches the minted admin path: 20 lowercase hex characters.
@@ -48,44 +46,6 @@ func adminPath(dir string) (string, error) {
 	return slug, nil
 }
 
-// vaultPasswordPath is the file the vault is encrypted with, defaulting to the
-// data directory so a container volume is self-contained.
-func vaultPasswordPath(dir string) string {
-	if path := os.Getenv("XGIFT_PASSWORD_FILE"); path != "" {
-		return path
-	}
-	return filepath.Join(dir, "vault-password")
-}
-
-// openVault opens the encrypted store, minting a password file on first start
-// so a fresh data volume comes up without the setup wizard. An operator that
-// already ran the wizard keeps using its file untouched.
-func openVault(dir string) (*vault.Vault, error) {
-	passwordFile := vaultPasswordPath(dir)
-	if _, err := os.Lstat(passwordFile); errors.Is(err, os.ErrNotExist) {
-		secret := make([]byte, 32)
-		if _, err = rand.Read(secret); err != nil {
-			return nil, err
-		}
-		f, err := os.OpenFile(passwordFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = f.WriteString(base64.RawURLEncoding.EncodeToString(secret) + "\n"); err != nil {
-			f.Close()
-			return nil, err
-		}
-		if err = f.Close(); err != nil {
-			return nil, err
-		}
-		log.Printf("已生成保管库密码文件 %s", passwordFile)
-		log.Printf("请立即备份该文件：丢失后保管库中的所有加密记录都无法恢复。")
-	}
-	dbPath := filepath.Join(dir, "vault.db")
-	_, statErr := os.Stat(dbPath)
-	return vault.Open(dbPath, passwordFile, errors.Is(statErr, os.ErrNotExist))
-}
-
 // adminPassword prefers the value from the environment; the file form stays
 // supported for deployments created by the setup wizard.
 func adminPassword(dir string) ([]byte, error) {
@@ -107,7 +67,7 @@ func adminPassword(dir string) ([]byte, error) {
 // can succeed before an operator configures anything. Records that already
 // exist are left alone, and the account pool is deliberately not seeded — it
 // only holds operator secrets and the admin UI is the intended place to add it.
-func seedDefaults(v *vault.Vault) error {
+func seedDefaults(v *store.Store) error {
 	auth, err := json.Marshal(map[string]string{
 		"Authorization": checkout.DefaultAPIAuthorization,
 		"UserAgent":     checkout.DefaultAPIUserAgent,
@@ -136,22 +96,4 @@ func seedDefaults(v *vault.Vault) error {
 		log.Printf("已写入默认配置：%s", name)
 	}
 	return nil
-}
-
-// vaultBackup hands the vault password to the admin UI so the operator can
-// back it up. This grants no new access — an admin session already decrypts
-// every record — and the UI keeps it masked until explicitly revealed. The
-// file is re-read per request rather than held in memory.
-func (s *server) vaultBackup(w http.ResponseWriter, r *http.Request) {
-	path := vaultPasswordPath(s.dir)
-	raw, err := privateFile(path)
-	if err != nil {
-		message(w, 503, "无法读取保管库密码文件。")
-		return
-	}
-	defer clear(raw)
-	reply(w, http.StatusOK, map[string]string{
-		"path":     path,
-		"password": strings.TrimSpace(string(raw)),
-	})
 }

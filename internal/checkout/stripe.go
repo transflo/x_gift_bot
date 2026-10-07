@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"xgift/internal/accounts"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 // stripeClient performs read-only Stripe requests through the same proxy as
@@ -23,7 +23,7 @@ import (
 type stripeClient struct {
 	http  *http.Client
 	key   string
-	vault *vault.Vault
+	records *store.Store
 }
 
 type stripeError struct {
@@ -44,7 +44,7 @@ func (*stripeTransportFailure) Error() string {
 	return "Stripe transport failed; request outcome may be unknown"
 }
 
-func newStripe(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, account accounts.Account) (*stripeClient, error) {
+func newStripe(ctx context.Context, v *store.Store, mgr *accounts.Manager, account accounts.Account) (*stripeClient, error) {
 	key, err := v.Get("stripe-key")
 	if err != nil {
 		return nil, errors.New("Stripe publishable key is missing; store it with setup or put --name stripe-key")
@@ -59,7 +59,7 @@ func newStripe(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, accou
 	}
 	client := *base
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return errStripeRedirect }
-	return &stripeClient{http: &client, key: string(key), vault: v}, nil
+	return &stripeClient{http: &client, key: string(key), records: v}, nil
 }
 
 func (s *stripeClient) close() {
@@ -117,12 +117,12 @@ func (s *stripeClient) call(ctx context.Context, method, path string, form url.V
 		se := &stripeError{Code: safeErrorField(envelope.Error.Code), Type: safeErrorField(envelope.Error.Type), HTTP: res.StatusCode, Message: msg, Param: safeErrorField(envelope.Error.Param), RequestID: safeErrorField(res.Header.Get("Request-Id"))}
 		diagnostic, _ := json.Marshal(map[string]any{"http_status": res.StatusCode, "path": path, "error": se, "observed_at": time.Now().Unix()})
 		defer clear(diagnostic)
-		if err := s.vault.Put("stripe-error:last", diagnostic); err != nil {
+		if err := s.records.Put("stripe-error:last", diagnostic); err != nil {
 			return errors.New("could not persist Stripe error; order requires inspection")
 		}
 		parts := strings.Split(path, "/")
 		if len(parts) >= 2 && parts[0] == "payment_pages" && sessionPattern.MatchString(parts[1]) {
-			if err := s.vault.Put("stripe-error:"+parts[1], diagnostic); err != nil {
+			if err := s.records.Put("stripe-error:"+parts[1], diagnostic); err != nil {
 				return errors.New("could not persist order payment error")
 			}
 		}

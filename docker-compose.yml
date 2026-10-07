@@ -9,7 +9,7 @@ services:
     env_file: .env
     environment:
       # 容器内必须监听 0.0.0.0 才能被端口映射转发；对外暴露由下面的
-      # 宿主机 127.0.0.1 绑定收敛，Caddy/Nginx 由宿主机自行提供 HTTPS。
+      # 宿主机 127.0.0.1 绑定收敛，公网入口交给 Cloudflare Tunnel（见 README）。
       XGIFT_LISTEN: 0.0.0.0:8787
       XGIFT_ALLOW_PUBLIC_LISTEN: "true"
       XGIFT_DATA_DIR: /data

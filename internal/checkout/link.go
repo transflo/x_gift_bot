@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"xgift/internal/accounts"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 // ErrNoAccount is returned when the pool has no enabled account.
@@ -33,7 +33,7 @@ type LinkRequest struct {
 
 // CreateLinkForRecipient is the single entry point for publishing a Stripe
 // checkout link. It never charges a card: the visitor pays on Stripe.
-func CreateLinkForRecipient(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, req LinkRequest) (*Record, error) {
+func CreateLinkForRecipient(ctx context.Context, v *store.Store, mgr *accounts.Manager, req LinkRequest) (*Record, error) {
 	user := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(req.User), "@"))
 	if !usernamePattern.MatchString(user) {
 		return nil, errors.New("invalid username")
@@ -210,7 +210,7 @@ func CreateLinkForRecipient(ctx context.Context, v *vault.Vault, mgr *accounts.M
 }
 
 // CreateAdminLink resolves the username, then reuses or creates its link.
-func CreateAdminLink(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, user string, months int) (*Record, error) {
+func CreateAdminLink(ctx context.Context, v *store.Store, mgr *accounts.Manager, user string, months int) (*Record, error) {
 	user = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(user), "@"))
 	if !usernamePattern.MatchString(user) {
 		return nil, errors.New("invalid username")
@@ -252,7 +252,7 @@ func CreateAdminLink(ctx context.Context, v *vault.Vault, mgr *accounts.Manager,
 
 // CheckLink verifies an existing link through its bound account and reports
 // the latest state. It never creates or replaces a session.
-func CheckLink(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, recipient string) (*Record, error) {
+func CheckLink(ctx context.Context, v *store.Store, mgr *accounts.Manager, recipient string) (*Record, error) {
 	r, err := LoadRecord(v, recipient)
 	if err != nil {
 		return nil, err
@@ -299,7 +299,7 @@ func CheckLink(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, recip
 
 // verifyExisting classifies an existing session. It returns true when the
 // caller may publish a replacement.
-func verifyExisting(ctx context.Context, v *vault.Vault, x *xClient, existing *Record, plan Plan, requested bool) (bool, error) {
+func verifyExisting(ctx context.Context, v *store.Store, x *xClient, existing *Record, plan Plan, requested bool) (bool, error) {
 	err := verifyPublicCheckout(ctx, v, x, existing, plan)
 	if err == nil {
 		if existing.Status == "succeeded" || !requested {
@@ -321,7 +321,7 @@ func verifyExisting(ctx context.Context, v *vault.Vault, x *xClient, existing *R
 	return true, nil
 }
 
-func verifyNewLink(ctx context.Context, v *vault.Vault, x *xClient, r *Record, plan Plan) error {
+func verifyNewLink(ctx context.Context, v *store.Store, x *xClient, r *Record, plan Plan) error {
 	s, err := x.stripe(ctx)
 	if err != nil {
 		return err
@@ -337,7 +337,7 @@ func verifyNewLink(ctx context.Context, v *vault.Vault, x *xClient, r *Record, p
 	return rememberVerifiedCheckout(v, r, plan, page)
 }
 
-func archiveReplaced(v *vault.Vault, existing *Record) error {
+func archiveReplaced(v *store.Store, existing *Record) error {
 	raw, err := v.Get(recordKey(existing.RecipientID))
 	if err != nil {
 		return err
@@ -360,7 +360,7 @@ func archiveReplaced(v *vault.Vault, existing *Record) error {
 	return v.Archive(recordKey(existing.RecipientID), history, raw, proof)
 }
 
-func planFor(v *vault.Vault, months int) (Plan, error) {
+func planFor(v *store.Store, months int) (Plan, error) {
 	catalog, err := ReadCatalog(v)
 	if err != nil {
 		return Plan{}, err
@@ -381,7 +381,7 @@ type ranked struct {
 // last probe failed pushed to the end. The caller walks this list when an
 // account turns out to be broken, so a dead proxy or a revoked cookie costs one
 // retry instead of the whole checkout.
-func rankAccounts(v *vault.Vault, enabled []accounts.Account, existing *Record, pinned string, usable func(string) bool, now time.Time) ([]ranked, error) {
+func rankAccounts(v *store.Store, enabled []accounts.Account, existing *Record, pinned string, usable func(string) bool, now time.Time) ([]ranked, error) {
 	preferred := pinned
 	if preferred == "" && existing != nil {
 		preferred = existing.AccountID
@@ -414,7 +414,7 @@ func rankAccounts(v *vault.Vault, enabled []accounts.Account, existing *Record, 
 }
 
 // pickReadAccount spreads read-only requests across the pool.
-func pickReadAccount(v *vault.Vault, enabled []accounts.Account) (accounts.Account, error) {
+func pickReadAccount(v *store.Store, enabled []accounts.Account) (accounts.Account, error) {
 	var best accounts.Account
 	var bestTime time.Time
 	for i, a := range enabled {

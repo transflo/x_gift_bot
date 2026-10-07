@@ -16,7 +16,7 @@ import (
 
 	"xgift/internal/accounts"
 	"xgift/internal/checkout"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func run() error {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
 			rest = append(rest, a)
-			if a == "--db" || a == "--password-file" || a == "--name" || a == "--months" || a == "--id" || a == "--label" {
+			if a == "--db" || a == "--name" || a == "--months" || a == "--id" || a == "--label" {
 				i++
 				if i >= len(args) {
 					return errors.New("missing flag value")
@@ -49,23 +49,22 @@ func run() error {
 		}
 	}
 	f := flag.NewFlagSet("xgift", flag.ContinueOnError)
-	defaultDB := "sqlite/vault.db"
+	defaultDB := "sqlite/records.db"
 	if exe, e := os.Executable(); e == nil {
 		if resolved, e := filepath.EvalSymlinks(exe); e == nil {
-			candidate := filepath.Join(filepath.Dir(resolved), "..", "sqlite", "vault.db")
+			candidate := filepath.Join(filepath.Dir(resolved), "..", "sqlite", "records.db")
 			if _, e = os.Stat(candidate); e == nil {
 				defaultDB = candidate
 			}
 		}
 	}
-	db := f.String("db", defaultDB, "encrypted SQLite record store")
-	key := f.String("password-file", os.Getenv("XGIFT_PASSWORD_FILE"), "owner-only password file")
+	db := f.String("db", defaultDB, "SQLite record store")
 	months := f.Int("months", 6, "gift duration in months; must match a plan in the catalog record")
 	name := f.String("name", "", "secret name for put")
 	id := f.String("id", "", "account id for accounts commands")
 	label := f.String("label", "", "account label when adding")
 	f.Usage = func() {
-		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|put|accounts|check|link> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put writes one encrypted record (--name accounts|api-auth|stripe-key|catalog). accounts list|add|remove|enable|disable|test manages the X account pool and its Shadowsocks proxies. link creates or reuses a Stripe payment link for one X username.")
+		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|put|accounts|check|link> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put writes one record (--name accounts|api-auth|stripe-key|catalog). accounts list|add|remove|enable|disable|test manages the X account pool and its Shadowsocks proxies. link creates or reuses a Stripe payment link for one X username.")
 		f.PrintDefaults()
 	}
 	if err := f.Parse(rest); err != nil {
@@ -79,7 +78,7 @@ func run() error {
 		return nil
 	}
 	if command == "setup" {
-		return runSetup(context.Background(), *db, *key)
+		return runSetup(context.Background(), *db)
 	}
 	if command == "init" {
 		input, err := io.ReadAll(io.LimitReader(os.Stdin, 1024*1024))
@@ -95,23 +94,14 @@ func run() error {
 			return errors.New("no secrets supplied")
 		}
 		if _, err = os.Stat(*db); !os.IsNotExist(err) {
-			return errors.New("vault already exists or path is inaccessible")
+			return errors.New("record store already exists or path is inaccessible")
 		}
-		if *key == "" {
-			*key, err = vault.NewPassword()
-			if err != nil {
-				return err
-			}
-		}
-		v, err := vault.Open(*db, *key, true)
+		v, err := store.Open(*db)
 		if err != nil {
 			return err
 		}
 		defer v.Close()
 		for n, b := range records {
-			if n == "vault-check" {
-				return errors.New("reserved secret name")
-			}
 			// A JSON string secret (for example the Stripe key) is stored as its
 			// decoded value; structured records keep their JSON form.
 			if len(b) > 0 && b[0] == '"' {
@@ -128,20 +118,10 @@ func run() error {
 				return err
 			}
 		}
-		if err = os.WriteFile(filepath.Join(filepath.Dir(*db), "password-path"), []byte(*key+"\n"), 0600); err != nil {
-			return err
-		}
-		fmt.Printf("Encrypted vault created: %s\nPassword file: %s\n", *db, *key)
+		fmt.Printf("Record store created: %s\n", *db)
 		return nil
 	}
-	if *key == "" {
-		p, err := os.ReadFile(filepath.Join(filepath.Dir(*db), "password-path"))
-		if err != nil {
-			return errors.New("set --password-file or XGIFT_PASSWORD_FILE")
-		}
-		*key = strings.TrimSpace(string(p))
-	}
-	v, err := vault.Open(*db, *key, false)
+	v, err := store.Open(*db)
 	if err != nil {
 		return err
 	}
@@ -194,7 +174,7 @@ func validateRecord(name string, b []byte) error {
 	}
 }
 
-func runStatus(v *vault.Vault) error {
+func runStatus(v *store.Store) error {
 	list, err := accounts.Load(v)
 	if err != nil {
 		return err
@@ -208,29 +188,27 @@ func runStatus(v *vault.Vault) error {
 	if enabled == 0 {
 		return accounts.ErrNoEnabledAccount
 	}
-	fmt.Printf("accounts: %d encrypted record(s), %d enabled\n", len(list), enabled)
+	fmt.Printf("accounts: %d record(s), %d enabled\n", len(list), enabled)
 	if _, err = v.Get("api-auth"); err != nil {
 		return errors.New("record api-auth is missing; fix with put --name api-auth")
 	}
-	fmt.Println("api-auth: encrypted record verified")
+	fmt.Println("api-auth: record verified")
 	key, err := v.Get("stripe-key")
 	if err != nil {
 		return errors.New("record stripe-key is missing; fix with put --name stripe-key")
 	}
 	if !checkout.ValidStripeKey(string(key)) {
-		clear(key)
 		return errors.New("invalid stripe-key record; rewrite with put --name stripe-key")
 	}
-	clear(key)
-	fmt.Println("stripe-key: encrypted record verified")
+	fmt.Println("stripe-key: record verified")
 	if _, err = checkout.ReadCatalog(v); err != nil {
 		return err
 	}
-	fmt.Println("catalog: encrypted record verified")
+	fmt.Println("catalog: record verified")
 	return nil
 }
 
-func runCheck(v *vault.Vault) error {
+func runCheck(v *store.Store) error {
 	list, err := accounts.Load(v)
 	if err != nil {
 		return err
@@ -261,7 +239,7 @@ func runCheck(v *vault.Vault) error {
 	return nil
 }
 
-func runAccounts(v *vault.Vault, sub, id, label string) error {
+func runAccounts(v *store.Store, sub, id, label string) error {
 	list, err := accounts.Load(v)
 	if err != nil {
 		list = []accounts.Account{}
@@ -370,7 +348,7 @@ func runAccounts(v *vault.Vault, sub, id, label string) error {
 	}
 }
 
-func runPut(v *vault.Vault, name string) error {
+func runPut(v *store.Store, name string) error {
 	if name == "" {
 		return errors.New("--name is required")
 	}
@@ -394,7 +372,7 @@ func runPut(v *vault.Vault, name string) error {
 	return nil
 }
 
-func runLink(v *vault.Vault, db string, user string, months int) error {
+func runLink(v *store.Store, db string, user string, months int) error {
 	user = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(user), "@"))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

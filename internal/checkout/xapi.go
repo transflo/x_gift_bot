@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"xgift/internal/accounts"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 type Plan struct {
@@ -30,7 +30,7 @@ var ErrXReadFailure = errors.New("X account or price query failed")
 
 // Eligibility is read-only: it neither creates a checkout nor publishes a
 // link. Any enabled account may serve the check.
-func Eligibility(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, user string) (string, error) {
+func Eligibility(ctx context.Context, v *store.Store, mgr *accounts.Manager, user string) (string, error) {
 	list, err := accounts.Load(v)
 	if err != nil {
 		return "", err
@@ -54,12 +54,12 @@ type xClient struct {
 	publicReplacement string
 	account           accounts.Account
 	mgr               *accounts.Manager
-	vault             *vault.Vault
+	records             *store.Store
 	http              *http.Client
 	headers           http.Header
 }
 
-func newXClient(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, account accounts.Account) (*xClient, error) {
+func newXClient(ctx context.Context, v *store.Store, mgr *accounts.Manager, account accounts.Account) (*xClient, error) {
 	raw, e := v.Get("api-auth")
 	if e != nil {
 		return nil, errors.New("X API authentication metadata is missing or unreadable")
@@ -82,11 +82,11 @@ func newXClient(ctx context.Context, v *vault.Vault, mgr *accounts.Manager, acco
 	}
 	client := *base
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return errors.New("unexpected X API redirect") }
-	return &xClient{account: account, mgr: mgr, http: &client, headers: h, vault: v}, nil
+	return &xClient{account: account, mgr: mgr, http: &client, headers: h, records: v}, nil
 }
 
 func (c *xClient) stripe(ctx context.Context) (*stripeClient, error) {
-	return newStripe(ctx, c.vault, c.mgr, c.account)
+	return newStripe(ctx, c.records, c.mgr, c.account)
 }
 
 func (c *xClient) close() { c.http.CloseIdleConnections() }
@@ -99,7 +99,7 @@ func (c *xClient) call(ctx context.Context, user, name, id string, variables any
 }
 
 func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables any, mutation bool, out any) (callErr error) {
-	// A fixed-operation audit is encrypted before a mutation is sent, then
+	// A fixed-operation audit is written before a mutation is sent, then
 	// completed even on transport/body failures. Headers and cookies are never
 	// stored here.
 	var audit struct {
@@ -123,7 +123,7 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 			audit.FinishedAt, audit.Failure = time.Now().Unix(), callErr.Error()
 			b, err := json.Marshal(audit)
 			defer clear(b)
-			if err != nil || c.vault.Put(fmt.Sprintf("x-read-failure:%s:%s:%d", user, name, time.Now().UnixNano()), b) != nil {
+			if err != nil || c.records.Put(fmt.Sprintf("x-read-failure:%s:%s:%d", user, name, time.Now().UnixNano()), b) != nil {
 				callErr = fmt.Errorf("%w: could not preserve failure details", ErrXReadFailure)
 				return
 			}
@@ -138,7 +138,7 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 				return e
 			}
 			defer clear(b)
-			return c.vault.Put(key, b)
+			return c.records.Put(key, b)
 		}
 		if e := persist(); e != nil {
 			return errors.New("could not preserve X creation attempt before sending")

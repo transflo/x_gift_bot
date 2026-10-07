@@ -17,7 +17,7 @@ import (
 
 	"xgift/internal/accounts"
 	"xgift/internal/checkout"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 type wizard struct {
@@ -101,34 +101,20 @@ func writeOwnerOnly(path string, data []byte) error {
 }
 
 // runSetup is the interactive first-time wizard; it refuses to touch an
-// existing vault so updates keep going through put/accounts.
-func runSetup(ctx context.Context, db, passwordFileFlag string) error {
+// existing record store so updates keep going through put/accounts.
+func runSetup(ctx context.Context, db string) error {
 	w := &wizard{r: bufio.NewReader(os.Stdin), tty: term.IsTerminal(int(os.Stdin.Fd()))}
 	fmt.Println("XGift 配置向导")
-	fmt.Println("本向导会依次配置：保管库密码、X 账号池（每个账号一个 Shadowsocks 代理）、Stripe 公钥、套餐目录和站点。")
-	if passwordFileFlag == "" {
-		passwordFileFlag = filepath.Join(filepath.Dir(db), "vault-password")
-	}
-	passwordPath, err := w.prompt("密码文件路径（用于加密保管库，请务必备份）", passwordFileFlag)
-	if err != nil {
+	fmt.Println("本向导会依次配置：X 账号池（每个账号一个 Shadowsocks 代理）、Stripe 公钥、套餐目录和站点。")
+	if err := os.MkdirAll(filepath.Dir(db), 0700); err != nil {
 		return err
 	}
-	password := make([]byte, 32)
-	if _, err = rand.Read(password); err != nil {
-		return err
-	}
-	if err = writeOwnerOnly(passwordPath, []byte(base64.RawURLEncoding.EncodeToString(password)+"\n")); err != nil {
-		return fmt.Errorf("密码文件无法写入（可能已存在）: %w", err)
-	}
-	if err = os.MkdirAll(filepath.Dir(db), 0700); err != nil {
-		return err
-	}
-	v, err := vault.Open(db, passwordPath, true)
+	v, err := store.Open(db)
 	if err != nil {
 		return err
 	}
 	defer v.Close()
-	fmt.Printf("已创建加密保管库：%s\n\n", db)
+	fmt.Printf("已创建记录库：%s\n\n", db)
 
 	if err = w.setupXAPI(v); err != nil {
 		return err
@@ -142,10 +128,10 @@ func runSetup(ctx context.Context, db, passwordFileFlag string) error {
 	if err = w.setupCatalog(v); err != nil {
 		return err
 	}
-	return w.setupSite(filepath.Dir(db), passwordPath)
+	return w.setupSite(filepath.Dir(db))
 }
 
-func (w *wizard) setupXAPI(v *vault.Vault) error {
+func (w *wizard) setupXAPI(v *store.Store) error {
 	fmt.Println("【1/5】X API 授权")
 	fmt.Println("直接回车使用内置的公开 Web Bearer（与网页版一致）。")
 	bearer, err := w.prompt("Authorization Bearer", checkout.DefaultAPIAuthorization)
@@ -166,7 +152,7 @@ func (w *wizard) setupXAPI(v *vault.Vault) error {
 
 // setupAccounts collects one or more X identities, each bound to exactly one
 // Shadowsocks proxy.
-func (w *wizard) setupAccounts(ctx context.Context, v *vault.Vault) error {
+func (w *wizard) setupAccounts(ctx context.Context, v *store.Store) error {
 	fmt.Println("\n【2/5】X 账号池")
 	fmt.Println("每个账号需要一个 auth_token、ct0 和一个 Shadowsocks 代理（一个账号对应一个代理）。")
 	fmt.Println("浏览器登录 x.com 后，在开发者工具 → Application → Cookies 中复制 auth_token 与 ct0。")
@@ -242,7 +228,7 @@ func (w *wizard) setupAccounts(ctx context.Context, v *vault.Vault) error {
 	return accounts.Save(v, list)
 }
 
-func (w *wizard) setupStripeKey(v *vault.Vault) error {
+func (w *wizard) setupStripeKey(v *store.Store) error {
 	fmt.Println("\n【3/5】Stripe 公钥")
 	fmt.Println("填写 X 结账页使用的 pk_live_ 公钥。")
 	for {
@@ -258,7 +244,7 @@ func (w *wizard) setupStripeKey(v *vault.Vault) error {
 	}
 }
 
-func (w *wizard) setupCatalog(v *vault.Vault) error {
+func (w *wizard) setupCatalog(v *store.Store) error {
 	fmt.Println("\n【4/5】套餐目录")
 	useDefault, err := w.yesNo("使用 X Premium 默认目录（3/6 个月）", true)
 	if err != nil {
@@ -323,7 +309,7 @@ func (w *wizard) customCatalog() (checkout.Catalog, error) {
 	return catalog, nil
 }
 
-func (w *wizard) setupSite(dir, passwordPath string) error {
+func (w *wizard) setupSite(dir string) error {
 	fmt.Println("\n【5/5】站点配置")
 	origin, err := w.prompt("站点完整域名（https:// 开头）", "https://example.com")
 	if err != nil {
@@ -341,7 +327,7 @@ func (w *wizard) setupSite(dir, passwordPath string) error {
 	if err = writeOwnerOnly(adminPath, []byte(adminPassword+"\n")); err != nil {
 		return fmt.Errorf("管理员密码文件无法写入（可能已存在）: %w", err)
 	}
-	env := fmt.Sprintf("XGIFT_ORIGIN=%s\nXGIFT_LISTEN=127.0.0.1:8787\nXGIFT_DATA_DIR=%s\nXGIFT_PASSWORD_FILE=%s\nXGIFT_ADMIN_PASSWORD_FILE=%s\nXGIFT_PAYMENTS_ENABLED=true\n", origin, dir, passwordPath, adminPath)
+	env := fmt.Sprintf("XGIFT_ORIGIN=%s\nXGIFT_LISTEN=127.0.0.1:8787\nXGIFT_DATA_DIR=%s\nXGIFT_ADMIN_PASSWORD_FILE=%s\nXGIFT_PAYMENTS_ENABLED=true\n", origin, dir, adminPath)
 	envPath := filepath.Join(dir, "site.env")
 	if err = writeOwnerOnly(envPath, []byte(env)); err != nil {
 		return fmt.Errorf("站点配置无法写入（可能已存在）: %w", err)

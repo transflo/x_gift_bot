@@ -8,13 +8,13 @@ import (
 	"net/url"
 	"strings"
 
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 // rememberVerifiedCheckout preserves the merchant/product/price binding before
 // a visitor pays outside this process. There is no server-side confirmation
 // request for public links, so verifySubmission cannot be used for their result.
-func rememberVerifiedCheckout(v *vault.Vault, r *Record, plan Plan, page *paymentPage) error {
+func rememberVerifiedCheckout(v *store.Store, r *Record, plan Plan, page *paymentPage) error {
 	if err := page.guard(r, plan, false); err != nil {
 		return err
 	}
@@ -29,7 +29,7 @@ func rememberVerifiedCheckout(v *vault.Vault, r *Record, plan Plan, page *paymen
 	return v.Put("checkout-verification:"+r.SessionID, raw)
 }
 
-func verifiedCheckoutPaid(ctx context.Context, v *vault.Vault, x *xClient, r *Record, plan Plan) (bool, error) {
+func verifiedCheckoutPaid(ctx context.Context, v *store.Store, x *xClient, r *Record, plan Plan) (bool, error) {
 	s, err := x.stripe(ctx)
 	if err != nil {
 		return false, err

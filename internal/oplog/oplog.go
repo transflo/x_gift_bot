@@ -276,7 +276,7 @@ func (l *Log) tailBytes(want, limit int64) ([]byte, error) {
 }
 
 // OpenFile returns a reader for one named log file. Only names this log owns
-// are accepted, so the admin download endpoint cannot be pointed at the vault.
+// are accepted, so the admin download endpoint cannot be pointed at the record store.
 func (l *Log) OpenFile(name string) (*os.File, int64, error) {
 	if name == "" {
 		name = filepath.Base(l.path)

@@ -6,21 +6,21 @@ X (Twitter) Premium 礼品兑换平台。你生成兑换码发给用户；用户
 - **兑换页** `/redeem/`：输入兑换码与用户名，实时显示生成进度与付款链接，付款后自动更新
 - **管理后台**：兑换码、批次文件夹、统计、X 账号池与代理池、付款链接状态、手动生成链接、Stripe 公钥、站点公告、日志。路径每次安装随机生成，只在启动日志里输出
 - **代理池**：后台每 5 分钟自动测活，检出失败（代理不可达、Cookie 失效、账号被封、被限流）会自动换下一个账号
-- **长期运行**：保管库保留策略 + 日志滚动 + 容器日志上限，磁盘占用在后台「设置」里可见
+- **长期运行**：记录保留策略 + 日志滚动 + 容器日志上限，磁盘占用在后台「设置」里可见
 
 ## Docker Compose 部署（推荐）
 
-准备一台能运行 Docker 的 Linux 服务器、一个解析到该服务器的域名、至少一个 X 账号（`auth_token`、`ct0`）及其对应的 Shadowsocks 代理、以及 X 结账页使用的 `pk_live_` Stripe 公钥（可以稍后在后台「设置」里填）。HTTPS 由宿主机上的反向代理提供，容器只监听 `127.0.0.1`。
+准备一台能运行 Docker 的 Linux 服务器、一个托管在 Cloudflare 的域名、至少一个 X 账号（`auth_token`、`ct0`）及其对应的 Shadowsocks 代理、以及 X 结账页使用的 `pk_live_` Stripe 公钥（可以稍后在后台「设置」里填）。容器只监听 `127.0.0.1`，不开放任何公网端口，对外由 Cloudflare Tunnel 回源（见下一节）。
 
 ```sh
 git clone https://github.com/transflo/x_gift_bot.git
 cd x_gift_bot
 cp .env.example .env
-# 编辑 .env：XGIFT_ORIGIN、XGIFT_ADMIN_PASSWORD
+# 编辑 .env：XGIFT_ORIGIN 填你的公网域名，XGIFT_ADMIN_PASSWORD 填 32 位以上随机密码
 docker compose up -d
 ```
 
-首次启动会自动生成保管库密码文件、创建保管库，并写入内置的 X API 授权与默认套餐目录。**保管库密码就在数据卷里，请务必按下面的提示备份**；丢失后所有加密记录都无法恢复。
+首次启动会建库，并写入内置的 X API 授权与默认套餐目录。
 
 Stripe 公钥和站点公告都在后台「设置」里配置，保存即生效，不需要重启容器。
 
@@ -38,35 +38,36 @@ X 账号池在后台「账号」标签页添加，每个账号需要 `auth_token
 
 ```sh
 docker compose logs -f xgift                    # 日志（含管理后台地址）
-docker compose run --rm xgift sh -c 'cat /data/vault-password'   # 保管库密码（后台首页也能看）
 
-# 其余命令都带同样的保管库参数，先设好变量
-V="--db /data/vault.db --password-file /data/vault-password"
 X="docker compose run --rm xgift"
+V="--db /data/records.db"
 
-$X status $V                                    # 校验全部加密记录
+$X status $V                                    # 校验账号池、API 授权、Stripe 公钥与套餐目录
 $X accounts list $V                             # 查看账号池
 $X accounts test $V                             # 立即测活全部账号
 $X link alice --months 3 $V                     # 生成一次性付款链接（无需兑换码）
 ```
 
-**备份**：所有状态都在 named volume `xgift-data`（`vault.db`、`site.db`、`logs/`、`vault-password`、`admin-path`）。定期备份整个卷；`vault-password` 单独丢失同样会导致记录无法恢复。
+**备份**：所有状态都在 named volume `xgift-data`（`records.db`、`site.db`、`logs/`、`admin-path`）。定期备份整个卷。记录库是明文的，卷备份等同于备份全部凭据，请按敏感数据保存。
 
 **更新**：`git pull && docker compose build && docker compose up -d`。数据库升级是增量式的，已有兑换码与订单会保留。
 
-## 反向代理
+> 从「保管库」版本升级上来的注意：记录库换了文件（`vault.db` → 明文 `records.db`）且不再有密码文件，旧库不会被自动接管。全新启动后需要重新添加 X 账号池，并从「设置」里重填 Stripe 公钥。旧卷可以留作冷备。
 
-容器只绑定 `127.0.0.1:${XGIFT_PORT:-8787}`，HTTPS 由宿主机负责。反代**必须传递 `X-Real-IP`**，否则限流会把所有请求算到代理这一个 IP 上。
+## Cloudflare Tunnel
 
-`deploy/Caddyfile` 是可直接加载的 Caddy 模板（设置 `XGIFT_DOMAIN` 即自动申请证书）。Nginx 对应配置：
+容器只绑定 `127.0.0.1:${XGIFT_PORT:-8787}`，不开放任何公网端口，宿主机上也不需要反向代理。装了 `cloudflared` 之后用 Tunnel 把它接到公网域名：
 
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:8787;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-}
+```sh
+cloudflared tunnel login
+cloudflared tunnel create xgift
+cloudflared tunnel route dns xgift xp.example.com    # 换成你的域名
+cloudflared tunnel run --url http://127.0.0.1:8787 xgift
 ```
+
+跑通之后按 cloudflared 的文档把它装成 systemd 服务，开机自启。访客真实 IP 由 cloudflared 写入 `X-Forwarded-For`，本站按此取值，不需要额外配置。
+
+**必须关掉 Rocket Loader**（Cloudflare 控制台 → Speed → Optimization）。它会把页面的 `<script src>` 改写成自己的异步加载器，而本站 CSP 只放行带 nonce 的脚本，加载器本身就被拦下，前端从此不会启动。症状很好认：后台页面一直转圈、连密码框都出不来，而服务器日志里什么都没有——请求根本没到容器。Auto Minify 也建议一并关掉。
 
 ## 环境变量
 
@@ -81,15 +82,15 @@ location / {
 | `XGIFT_PAYMENTS_ENABLED` | `true` 开放前台兑换，`false` 暂停（不消耗兑换码） |
 | `XGIFT_TURNSTILE_SITE_KEY` / `XGIFT_TURNSTILE_SECRET_FILE` | 可选 Cloudflare Turnstile 人机验证，两者必须同时配置 |
 
-以下仅在裸机部署或需要覆盖默认值时使用：`XGIFT_LISTEN`（默认 `127.0.0.1:8787`）、`XGIFT_ALLOW_PUBLIC_LISTEN`（监听非回环地址必须设为 `true`）、`XGIFT_DATA_DIR`（必填）、`XGIFT_PASSWORD_FILE`（默认 `$XGIFT_DATA_DIR/vault-password`）、`XGIFT_ADMIN_PASSWORD_FILE`（`XGIFT_ADMIN_PASSWORD` 的替代）。
+以下仅在裸机部署或需要覆盖默认值时使用：`XGIFT_LISTEN`（默认 `127.0.0.1:8787`）、`XGIFT_ALLOW_PUBLIC_LISTEN`（监听非回环地址必须设为 `true`）、`XGIFT_DATA_DIR`（必填）、`XGIFT_ADMIN_PASSWORD_FILE`（`XGIFT_ADMIN_PASSWORD` 的替代，密码放 0600 文件而不进环境变量）。
 
 `/livez` 是存活探针（进程与数据库可用即 200，Docker 健康检查用它）；`/healthz` 是就绪探针，账号池为空时返回 503。
 
 ## 后台「设置」
 
-- **Stripe 公钥**：校验格式后写入保管库，可用于替换 `XGIFT_STRIPE_KEY` 的初始值。同页显示套餐目录解析出的商户、币种与金额，用来核对配置是否生效。
+- **Stripe 公钥**：校验格式后写入记录库，可用于替换 `XGIFT_STRIPE_KEY` 的初始值。同页显示套餐目录解析出的商户、币种与金额，用来核对配置是否生效。
 - **站点公告**：开启后在首页与兑换页顶部显示一条横幅，可选普通／提醒／重要三种语气，保存即生效，不需要重新构建镜像。
-- **存储占用**：所在分区剩余空间、各数据库与日志文件体积、每一类保管库记录的条数与占用。
+- **存储占用**：所在分区剩余空间、各数据库与日志文件体积、每一类记录的条数与占用。
 
 ## 日志
 
@@ -97,7 +98,7 @@ location / {
 
 记录内容包括请求方法、路径、状态码、耗时、User-Agent、Referer，以及**访问者真实 IP**，还有订单事件（链接生成、付款确认、生成失败）和管理员操作。
 
-IP 取自反向代理的 `X-Real-IP`，其次 `X-Forwarded-For`，都没有时才退回连接来源——在容器里那会是代理的内网地址（通常形如 `172.x.x.x`），这正是反代必须传递真实 IP 头的原因。看日志时如果满屏是内网地址，就是反代漏了这一步。
+IP 取自 `X-Real-IP`，其次 `X-Forwarded-For`，都没有时才退回连接来源——在容器里那会是代理的内网地址（通常形如 `172.x.x.x`）。Cloudflare Tunnel 会写入 `X-Forwarded-For`；如果用的是自建反向代理，记得让它传递真实 IP，否则所有访客会共用一个限流桶。
 
 请求 URL 中的查询参数不写入日志，所以下载下来的文件可以直接交给他人查看。
 
@@ -113,8 +114,6 @@ IP 取自反向代理的 `X-Real-IP`，其次 `X-Forwarded-For`，都没有时�
 | 换链接历史 `checkout-history:` | 90 天 |
 
 兑换码原文、订单绑定、账号池、API 授权与套餐目录**不会**被删除——它们是业务数据，不是运行痕迹。清理后如果碎片占比明显会执行一次 `VACUUM`，并截断 SQLite 的 WAL 文件。
-
-升级到带保留策略的版本时，已有记录的时间戳会从升级那一刻开始计算，不会立刻被删。
 
 ## 工作方式
 
@@ -140,9 +139,9 @@ X 请求不读取环境代理，全部走账号绑定的 Shadowsocks 出口；St
 
 ```
 xgift setup                      交互式首次配置（可选：自定义套餐目录或预装账号池时才需要）
-xgift init                       从 stdin 读取 JSON 记录创建保管库（accounts/api-auth/stripe-key/catalog）
+xgift init                       从 stdin 读取 JSON 记录建库（accounts/api-auth/stripe-key/catalog）
 xgift status                     校验账号池、API 授权、Stripe 公钥与套餐目录
-xgift put --name <name>          覆盖单个加密记录
+xgift put --name <name>          覆盖单个记录
 xgift accounts list|add|remove|enable|disable|test   管理 X 账号池
 xgift check                      测试全部账号代理到 X 的连通性
 xgift link <username> --months N 生成或复用付款链接并打印 URL
@@ -169,23 +168,23 @@ CGO_ENABLED=1 go build -tags with_quic,with_utls -o bin/xgift     ./cmd/xgift
 CGO_ENABLED=1 go build -tags with_quic,with_utls -o bin/xgift-web ./cmd/xgift-web
 ```
 
-按 `deploy/site.env.example` 准备 `/etc/xgift/site.env`（0600），填好 `XGIFT_ORIGIN`、`XGIFT_ADMIN_PASSWORD`（`XGIFT_STRIPE_KEY` 可选），首次启动会自动建库并生成保管库密码。按需修改 `deploy/xgift.service` 后：
+按 `deploy/site.env.example` 准备 `/etc/xgift/site.env`（0600），填好 `XGIFT_ORIGIN`、`XGIFT_ADMIN_PASSWORD`（`XGIFT_STRIPE_KEY` 可选），首次启动会自动建库。按需修改 `deploy/xgift.service` 后：
 
 ```sh
 sudo systemctl link $PWD/deploy/xgift.service
 sudo systemctl enable --now xgift
 ```
 
-`deploy/Caddyfile` 是宿主机反向代理模板，设置 `XGIFT_DOMAIN` 后加载即可。
+对外访问同样走 Cloudflare Tunnel，把它指向 `127.0.0.1:8787` 即可。
 
 需要自定义套餐目录或预装账号池时，再运行 `./bin/xgift setup` 交互式向导。
 
 ## 安全
 
-- 敏感记录（X Cookie、代理密码、Stripe 公钥、兑换码明文）逐条 AES-256-GCM 加密后存入 SQLite 保管库。
+- 敏感记录（X Cookie、代理密码、Stripe 公钥、兑换码明文）**明文**存在 SQLite 记录库 `records.db` 里。保护它的是文件权限（0600）与数据目录（0700）——拿到这个文件就等于拿到全部凭据，卷备份请按敏感数据对待。
 - 后台路径每次安装随机生成（`admin-path`，0600），只在启动日志输出；公开页面不含任何指向它的链接。
-- 后台使用 Basic Auth（仅密码）；`/api/*` 与后台路径按 IP 限流，超出返回 429。
-- 每个响应使用独立 CSP nonce，禁止内联脚本与外部资源；静态资源由 Go 二进制内嵌提供。
+- 后台使用 Basic Auth（仅密码），管理员密码下限 32 字符；`/api/*` 与后台 API 按 IP 限流，超出返回 429。密码建议用 `openssl rand -base64 24` 生成。
+- 每个响应使用独立 CSP nonce，禁止内联脚本与外部资源；静态资源由 Go 二进制内嵌提供。**因此不要在 Cloudflare 上开 Rocket Loader**，见上文。
 - 服务端不包含任何银行卡数据，也不会向 Stripe 提交付款。
 
 > 随机路径只是让登录页躲开自动扫描，真正的防线是密码。`XGIFT_ADMIN_PASSWORD` 请用 `openssl rand -base64 24` 生成。

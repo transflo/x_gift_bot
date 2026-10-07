@@ -3,14 +3,12 @@ package checkout
 import (
 	"errors"
 	"net/http"
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"xgift/internal/accounts"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 // accountFault decides whether a checkout failure is worth retrying on another
@@ -37,14 +35,9 @@ func TestAccountFaultClassification(t *testing.T) {
 	}
 }
 
-func testPool(t *testing.T) (*vault.Vault, []accounts.Account) {
+func testPool(t *testing.T) (*store.Store, []accounts.Account) {
 	t.Helper()
-	dir := t.TempDir()
-	password := filepath.Join(dir, "password")
-	if err := os.WriteFile(password, []byte(strings.Repeat("p", 32)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	v, err := vault.Open(filepath.Join(dir, "vault.db"), password, true)
+	v, err := store.Open(filepath.Join(t.TempDir(), "records.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

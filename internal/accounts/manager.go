@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"xgift/internal/proxy"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
-// RecordName is the encrypted vault record that stores the account pool.
+// RecordName is the record that stores the account pool.
 const RecordName = "accounts"
 
 // Manager starts and caches one embedded sing-box instance per account. The
@@ -112,9 +112,9 @@ func (m *Manager) Close() {
 	}
 }
 
-// Load reads the encrypted account pool. Legacy single-account installs
+// Load reads the account pool. Legacy single-account installs
 // (cookies + a standalone shadowsocks outbound) are migrated once.
-func Load(v *vault.Vault) ([]Account, error) {
+func Load(v *store.Store) ([]Account, error) {
 	raw, err := v.Get(RecordName)
 	if err == nil {
 		defer clear(raw)
@@ -136,7 +136,7 @@ func Load(v *vault.Vault) ([]Account, error) {
 	return accounts, nil
 }
 
-func Save(v *vault.Vault, list []Account) error {
+func Save(v *store.Store, list []Account) error {
 	if len(list) > 64 {
 		return errors.New("at most 64 X accounts are supported")
 	}
@@ -161,7 +161,7 @@ func Save(v *vault.Vault, list []Account) error {
 // migrateLegacy converts the pre-pool records into one account. It refuses to
 // guess: unless the old proxy record is exactly one shadowsocks outbound the
 // operator must configure the pool explicitly.
-func migrateLegacy(v *vault.Vault) ([]Account, error) {
+func migrateLegacy(v *store.Store) ([]Account, error) {
 	cookies, err := v.Get("cookies")
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

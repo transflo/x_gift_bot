@@ -6,7 +6,7 @@ import (
 )
 
 // Retention windows. These are records the system wrote for its own use, never
-// the product: a code's encrypted value, an order binding, an account's
+// the product: a code's value, an order binding, an account's
 // throttle slot and the single API credential are all kept forever.
 //
 // The balance each one strikes:
@@ -47,12 +47,12 @@ func (s *server) maintain() retentionResult {
 	now := time.Now()
 	result := retentionResult{At: now.Unix(), ByPrefix: map[string]int{}}
 	for _, rule := range retentionRules {
-		before, err := s.vault.CountPrefixes(rule.Prefix)
+		before, err := s.records.CountPrefixes(rule.Prefix)
 		if err != nil {
-			result.Err = "无法统计保管库记录"
+			result.Err = "无法统计记录"
 			break
 		}
-		removed, err := s.vault.PrunePrefixes(pruneCutoff(now, rule.Days), rule.Prefix)
+		removed, err := s.records.PrunePrefixes(pruneCutoff(now, rule.Days), rule.Prefix)
 		if err != nil {
 			result.Err = "无法删除过期记录"
 			break
@@ -66,9 +66,9 @@ func (s *server) maintain() retentionResult {
 		result.ByPrefix[rule.Prefix] = min(removed, before[rule.Prefix].Records)
 	}
 	if result.Err == "" {
-		vacuumed, err := s.vault.Compact()
+		vacuumed, err := s.records.Compact()
 		if err != nil {
-			result.Err = "无法回收保管库空间"
+			result.Err = "无法回收存储空间"
 		}
 		result.Vacuumed = vacuumed
 	}

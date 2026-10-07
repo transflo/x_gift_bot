@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 // Catalog is the operator-configured Stripe merchant and gift plan list,
-// stored as the encrypted vault record "catalog". Amounts are minor units.
+// stored as the record "catalog". Amounts are minor units.
 type Catalog struct {
 	Merchant string        `json:"merchant"`
 	Currency string        `json:"currency"`
@@ -60,7 +60,7 @@ func ParseCatalog(raw []byte) (Catalog, error) {
 
 // ReadCatalog loads the catalog per checkout flow, like the Stripe key, so the
 // site boots before the record exists and checkouts fail with a clear error.
-func ReadCatalog(v *vault.Vault) (Catalog, error) {
+func ReadCatalog(v *store.Store) (Catalog, error) {
 	raw, err := v.Get("catalog")
 	if err != nil {
 		return Catalog{}, errors.New("catalog record is missing or unreadable; write it with setup or put --name catalog")

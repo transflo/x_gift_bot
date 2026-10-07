@@ -326,7 +326,7 @@ export function SettingsPanel({ password }: { password: string }) {
             存储占用
           </CardTitle>
           <CardDescription>
-            保管库与日志都会长期增长；系统每天自动清理一次过期记录，日志按大小滚动。
+            记录库与日志都会长期增长；系统每天自动清理一次过期记录，日志按大小滚动。
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
@@ -384,7 +384,7 @@ export function SettingsPanel({ password }: { password: string }) {
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>保管库记录</TableHead>
+                      <TableHead>记录</TableHead>
                       <TableHead className="text-right">条数</TableHead>
                       <TableHead className="text-right">占用</TableHead>
                       <TableHead>保留策略</TableHead>

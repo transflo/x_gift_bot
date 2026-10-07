@@ -116,7 +116,7 @@ func TestRotationBoundsFileCount(t *testing.T) {
 // itself has to refuse anything the logger does not own.
 func TestOpenFileRejectsForeignNames(t *testing.T) {
 	l := openTest(t)
-	for _, name := range []string{"../../etc/passwd", "vault-password", "vault.db", "xgift.log.bak", "/etc/shadow"} {
+	for _, name := range []string{"../../etc/passwd", "records.db", "xgift.log.bak", "/etc/shadow"} {
 		if f, _, err := l.OpenFile(name); err == nil {
 			f.Close()
 			t.Errorf("OpenFile(%q) should have been refused", name)

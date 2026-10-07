@@ -6,10 +6,10 @@ import (
 	"net/url"
 	"regexp"
 
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
-// Record is the durable, encrypted description of one Stripe checkout session
+// Record is the durable description of one Stripe checkout session
 // created through an X account. It never contains card data or payment secrets.
 type Record struct {
 	AccountID         string `json:"account_id,omitempty"`
@@ -48,7 +48,7 @@ func CheckoutLink(r *Record) string {
 
 func recordKey(recipient string) string { return "checkout:" + recipient }
 
-func save(v *vault.Vault, r *Record) error {
+func save(v *store.Store, r *Record) error {
 	b, e := json.Marshal(r)
 	if e != nil {
 		return e
@@ -57,7 +57,7 @@ func save(v *vault.Vault, r *Record) error {
 }
 
 // LoadRecord reads one recipient's checkout record. sql.ErrNoRows means none.
-func LoadRecord(v *vault.Vault, recipient string) (*Record, error) {
+func LoadRecord(v *store.Store, recipient string) (*Record, error) {
 	raw, err := v.Get(recordKey(recipient))
 	if err != nil {
 		return nil, err

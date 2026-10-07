@@ -16,7 +16,6 @@ import {
 import { adminApi } from "@/lib/api"
 
 import { InlineError, type StatsResponse } from "./shared"
-import { VaultCard } from "./vault-card"
 
 function percent(value: number) {
   return `${(value * 100).toFixed(1)}%`
@@ -131,8 +130,6 @@ export function OverviewPanel({ password }: { password: string }) {
           </div>
         </CardContent>
       </Card>
-
-      <VaultCard password={password} />
 
       <Card className="p-0">
         <Table>

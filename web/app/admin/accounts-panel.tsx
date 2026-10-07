@@ -322,8 +322,8 @@ export function AccountsPanel({ password }: { password: string }) {
       </Card>
 
       <p className="text-xs leading-relaxed text-muted-foreground">
-        每个 X 账号绑定一个 Shadowsocks 代理，系统只支持 Shadowsocks。账号与代理凭据均以
-        AES-256-GCM 加密保存在保管库中，页面不会回显明文。
+        每个 X 账号绑定一个 Shadowsocks 代理，系统只支持 Shadowsocks。账号与代理凭据均保存在
+        记录库中，页面不会回显明文。
       </p>
 
       <Dialog open={draft !== null} onOpenChange={(value) => (!value ? setDraft(null) : undefined)}>

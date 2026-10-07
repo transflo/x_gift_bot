@@ -11,9 +11,9 @@ import (
 	"xgift/internal/oplog"
 )
 
-// announcementKey is the vault record holding the operator's banner. It lives
-// in the vault rather than site.db so a backup of the encrypted store carries
-// the site's configuration with it.
+// announcementKey is the record holding the operator's banner. It lives
+// outside site.db so a backup of the record store carries the site's
+// configuration with it.
 const announcementKey = "announcement"
 
 // maxAnnouncementRunes keeps the banner to a single readable line on a phone.
@@ -75,7 +75,7 @@ func normalizeAnnouncement(a announcement) (announcement, error) {
 // enabled=false rather than 404, so the page can decide without treating a
 // normal state as an error.
 func (s *server) announcement(w http.ResponseWriter, r *http.Request) {
-	current, err := readAnnouncement(s.vault)
+	current, err := readAnnouncement(s.records)
 	if err != nil || !current.Enabled {
 		reply(w, 200, map[string]any{"enabled": false})
 		return
@@ -99,7 +99,7 @@ func (s *server) saveAnnouncement(w http.ResponseWriter, r *http.Request) {
 		message(w, 503, "公告保存失败。")
 		return
 	}
-	if err = s.vault.Put(announcementKey, raw); err != nil {
+	if err = s.records.Put(announcementKey, raw); err != nil {
 		message(w, 503, "公告保存失败，请稍后重试。")
 		return
 	}

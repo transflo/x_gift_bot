@@ -48,7 +48,7 @@ func (s *server) customerOrder(w http.ResponseWriter, r *http.Request) {
 	decorate(&c)
 	plain := ""
 	if c.Copyable {
-		b, e := s.vault.Get("redemption:" + c.ID)
+		b, e := s.records.Get("redemption:" + c.ID)
 		if e != nil {
 			message(w, 503, "无法读取卡密，请稍后重试。")
 			return
@@ -62,7 +62,7 @@ func (s *server) customerOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	link := c.StripeURL
 	if link == "" && c.RecipientID != "" {
-		if record, e := checkout.LoadRecord(s.vault, c.RecipientID); e == nil {
+		if record, e := checkout.LoadRecord(s.records, c.RecipientID); e == nil {
 			link = checkout.CheckoutLink(record)
 		}
 	}

@@ -1,11 +1,11 @@
 package checkout
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"xgift/internal/vault"
+
+	"xgift/internal/store"
 )
 
 func TestParseCatalog(t *testing.T) {
@@ -58,12 +58,7 @@ func TestCatalogPlanFor(t *testing.T) {
 }
 
 func TestReadCatalogMissing(t *testing.T) {
-	dir := t.TempDir()
-	password := filepath.Join(dir, "password")
-	if err := os.WriteFile(password, []byte(strings.Repeat("p", 32)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	v, err := vault.Open(filepath.Join(dir, "vault.db"), password, true)
+	v, err := store.Open(filepath.Join(t.TempDir(), "records.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

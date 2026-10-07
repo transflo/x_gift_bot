@@ -84,18 +84,17 @@ type recordUsage struct {
 // catalog resolves to, the live banner, and what is on disk.
 func (s *server) readSettings(w http.ResponseWriter, r *http.Request) {
 	view := stripeKeyView{Source: "缺失"}
-	if raw, err := s.vault.Get("stripe-key"); err == nil {
+	if raw, err := s.records.Get("stripe-key"); err == nil {
 		key := strings.TrimSpace(string(raw))
-		clear(raw)
 		view.Set = true
 		view.Key = key
-		view.Source = "保管库"
+		view.Source = "记录库"
 		if !checkout.ValidStripeKey(key) {
 			view.Invalid = "当前记录不是有效的 pk_live_ 公钥，结算会被拒绝。"
 		}
 	}
 	catalog := catalogView{}
-	if cat, err := checkout.ReadCatalog(s.vault); err != nil {
+	if cat, err := checkout.ReadCatalog(s.records); err != nil {
 		catalog.Error = "套餐目录不可用，无法创建付款链接。"
 	} else {
 		catalog.Available = true
@@ -103,7 +102,7 @@ func (s *server) readSettings(w http.ResponseWriter, r *http.Request) {
 		catalog.Currency = strings.ToUpper(cat.Currency)
 		catalog.Plans = cat.Plans
 	}
-	current, _ := readAnnouncement(s.vault)
+	current, _ := readAnnouncement(s.records)
 	ready, _ := s.paymentsAvailable()
 	reply(w, 200, settingsResponse{
 		StripeKey:       view,
@@ -117,7 +116,7 @@ func (s *server) readSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) storageReport() storageReport {
 	var report storageReport
-	for _, name := range []string{"vault.db", "site.db", "site.db-wal", "site.db-shm"} {
+	for _, name := range []string{"records.db", "site.db", "site.db-wal", "site.db-shm"} {
 		if info, err := os.Stat(filepath.Join(s.dir, name)); err == nil && info.Size() > 0 {
 			report.Files = append(report.Files, storageFile{Name: name, Bytes: info.Size()})
 		}
@@ -138,7 +137,7 @@ func (s *server) storageReport() storageReport {
 		days[rule.Prefix] = rule.Days
 	}
 	for _, entry := range usagePrefixes {
-		usage, err := s.vault.CountPrefixes(entry.Prefix)
+		usage, err := s.records.CountPrefixes(entry.Prefix)
 		if err != nil {
 			continue
 		}
@@ -168,7 +167,7 @@ func (s *server) saveStripeKey(w http.ResponseWriter, r *http.Request) {
 		message(w, 400, "这不是有效的 pk_live_ 公钥；请填写 X 结账页使用的 Stripe publishable key。")
 		return
 	}
-	if err := s.vault.Put("stripe-key", []byte(key)); err != nil {
+	if err := s.records.Put("stripe-key", []byte(key)); err != nil {
 		message(w, 503, "保存失败，请稍后重试。")
 		return
 	}

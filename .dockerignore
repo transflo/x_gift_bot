@@ -28,4 +28,3 @@ data
 !.env.example
 site.env
 admin-password
-vault-password

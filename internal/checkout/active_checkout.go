@@ -7,7 +7,7 @@ import (
 	"errors"
 	"time"
 
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 const activeCheckoutPrefix = "checkout-creation:active:"
@@ -37,7 +37,7 @@ type activeCheckout struct {
 
 func activeKey(accountID string) string { return activeCheckoutPrefix + accountID }
 
-func saveActiveCheckout(v *vault.Vault, accountID string, a activeCheckout) error {
+func saveActiveCheckout(v *store.Store, accountID string, a activeCheckout) error {
 	b, err := json.Marshal(a)
 	if err != nil {
 		return err
@@ -45,7 +45,7 @@ func saveActiveCheckout(v *vault.Vault, accountID string, a activeCheckout) erro
 	return v.Put(activeKey(accountID), b)
 }
 
-func readActiveCheckout(v *vault.Vault, accountID string) (activeCheckout, error) {
+func readActiveCheckout(v *store.Store, accountID string) (activeCheckout, error) {
 	var a activeCheckout
 	b, err := v.Get(activeKey(accountID))
 	if err != nil {
@@ -68,7 +68,7 @@ func readActiveCheckout(v *vault.Vault, accountID string) (activeCheckout, error
 
 // holdPublicCheckout reserves the account's unpaid window for a freshly
 // published link. Callers hold checkout.lock.
-func holdPublicCheckout(v *vault.Vault, accountID string, r *Record, p Plan, now time.Time) error {
+func holdPublicCheckout(v *store.Store, accountID string, r *Record, p Plan, now time.Time) error {
 	if r.Status != "created" || !publicLinkFresh(r, now) {
 		return nil
 	}
@@ -89,7 +89,7 @@ func holdPublicCheckout(v *vault.Vault, accountID string, r *Record, p Plan, now
 
 // CheckoutCreationWait reports the persisted wait for one account without
 // contacting Stripe.
-func CheckoutCreationWait(v *vault.Vault, accountID string, now time.Time) (time.Duration, error) {
+func CheckoutCreationWait(v *store.Store, accountID string, now time.Time) (time.Duration, error) {
 	var wait time.Duration
 	a, err := readActiveCheckout(v, accountID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -120,19 +120,19 @@ func CheckoutCreationWait(v *vault.Vault, accountID string, now time.Time) (time
 // checkCreation verifies the account's current window before creating a new
 // session. A verified paid or declined window is released.
 func (x *xClient) checkCreation(ctx context.Context, accountID string, now time.Time) error {
-	a, err := readActiveCheckout(x.vault, accountID)
+	a, err := readActiveCheckout(x.records, accountID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return checkCheckoutCreation(x.vault, accountID, now)
+		return checkCheckoutCreation(x.records, accountID, now)
 	}
 	if err != nil {
 		return err
 	}
 	if !a.Released && a.ExpiresAt != 0 {
 		if x.publicReplacement != "" && a.Order.SessionID == x.publicReplacement {
-			return checkCheckoutCreation(x.vault, accountID, now)
+			return checkCheckoutCreation(x.records, accountID, now)
 		}
 		r := a.Order
-		verificationErr := verifyPublicCheckout(ctx, x.vault, x, &r, a.Plan)
+		verificationErr := verifyPublicCheckout(ctx, x.records, x, &r, a.Plan)
 		verified := verificationErr == nil && r.Status == "succeeded"
 		if !verified && !errors.Is(verificationErr, ErrPublicPaymentDeclined) {
 			paid, _ := x.checkoutPaid(ctx, &r, a.Plan)
@@ -144,11 +144,11 @@ func (x *xClient) checkCreation(ctx context.Context, accountID string, now time.
 		switch {
 		case verified:
 			a.Released, a.Order = true, r
-			if err := saveActiveCheckout(x.vault, accountID, a); err != nil {
+			if err := saveActiveCheckout(x.records, accountID, a); err != nil {
 				return err
 			}
 		case errors.Is(verificationErr, ErrPublicPaymentDeclined):
-			if _, err := releaseActiveCheckout(x.vault, accountID, r.SessionID); err != nil {
+			if _, err := releaseActiveCheckout(x.records, accountID, r.SessionID); err != nil {
 				return err
 			}
 		case time.Until(time.UnixMilli(a.ExpiresAt)) > 0:
@@ -157,21 +157,21 @@ func (x *xClient) checkCreation(ctx context.Context, accountID string, now time.
 			return &CheckoutWaitError{Wait: 10 * time.Second}
 		default:
 			a.Released = true
-			if err := saveActiveCheckout(x.vault, accountID, a); err != nil {
+			if err := saveActiveCheckout(x.records, accountID, a); err != nil {
 				return err
 			}
 		}
 	}
-	return checkCheckoutCreation(x.vault, accountID, now)
+	return checkCheckoutCreation(x.records, accountID, now)
 }
 
 func (x *xClient) checkoutPaid(ctx context.Context, r *Record, p Plan) (bool, error) {
-	return verifiedCheckoutPaid(ctx, x.vault, x, r, p)
+	return verifiedCheckoutPaid(ctx, x.records, x, r, p)
 }
 
 // releasePublicReplacement frees the account window held by the session the
 // operator explicitly replaced.
-func (x *xClient) releasePublicReplacement(v *vault.Vault, accountID string) error {
+func (x *xClient) releasePublicReplacement(v *store.Store, accountID string) error {
 	if x.publicReplacement == "" {
 		return nil
 	}
@@ -181,7 +181,7 @@ func (x *xClient) releasePublicReplacement(v *vault.Vault, accountID string) err
 
 // releaseActiveCheckout marks one session's window released. Other sessions'
 // windows are never touched.
-func releaseActiveCheckout(v *vault.Vault, accountID, session string) (bool, error) {
+func releaseActiveCheckout(v *store.Store, accountID, session string) (bool, error) {
 	a, err := readActiveCheckout(v, accountID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 var ErrCheckoutRateLimited = errors.New("checkout creation must be spaced at least 15 seconds apart per account")
@@ -18,7 +18,7 @@ func lastCreationKey(accountID string) string { return "checkout-creation:last:"
 // reserveCheckoutCreation is called under checkout.lock immediately before an
 // X mutation. Persist before sending: failures and restarts must not bypass
 // the per-account spacing.
-func reserveCheckoutCreation(v *vault.Vault, accountID string, now time.Time) error {
+func reserveCheckoutCreation(v *store.Store, accountID string, now time.Time) error {
 	if err := checkCheckoutCreation(v, accountID, now); err != nil {
 		return err
 	}
@@ -26,7 +26,7 @@ func reserveCheckoutCreation(v *vault.Vault, accountID string, now time.Time) er
 	return v.Put(lastCreationKey(accountID), b)
 }
 
-func checkCheckoutCreation(v *vault.Vault, accountID string, now time.Time) error {
+func checkCheckoutCreation(v *store.Store, accountID string, now time.Time) error {
 	b, err := v.Get(lastCreationKey(accountID))
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -44,7 +44,7 @@ func checkCheckoutCreation(v *vault.Vault, accountID string, now time.Time) erro
 }
 
 // LastCreation reports the persisted creation time for load balancing.
-func LastCreation(v *vault.Vault, accountID string) time.Time {
+func LastCreation(v *store.Store, accountID string) time.Time {
 	b, err := v.Get(lastCreationKey(accountID))
 	if err != nil {
 		return time.Time{}

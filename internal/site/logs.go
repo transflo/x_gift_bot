@@ -52,7 +52,7 @@ func (s *server) readLogs(w http.ResponseWriter, r *http.Request) {
 
 // downloadLog streams one log file as an attachment. Names are validated
 // against the files the logger owns, so this endpoint cannot be walked onto the
-// vault or the site database.
+// record store or the site database.
 func (s *server) downloadLog(w http.ResponseWriter, r *http.Request) {
 	f, size, err := s.logs.OpenFile(r.URL.Query().Get("file"))
 	if err != nil {

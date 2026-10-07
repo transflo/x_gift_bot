@@ -22,7 +22,7 @@ func (s *server) paymentsAvailable() (bool, error) {
 	if !s.payments {
 		return false, nil
 	}
-	list, err := accounts.Load(s.vault)
+	list, err := accounts.Load(s.records)
 	if err != nil {
 		return false, err
 	}
@@ -194,7 +194,7 @@ func (s *server) runLinkJob(codeID, user string, replace bool) {
 	}
 	recipient := c.RecipientID
 	if !replace && recipient == "" {
-		probe, probeErr := checkout.Eligibility(ctx, s.vault, s.accounts, user)
+		probe, probeErr := checkout.Eligibility(ctx, s.records, s.accounts, user)
 		if probeErr != nil {
 			s.redeemEligibilityFailure(codeID, probeErr)
 			return
@@ -216,7 +216,7 @@ func (s *server) runLinkJob(codeID, user string, replace bool) {
 			s.updateProcessing(codeID, 30, "生成超时，请稍后重试。")
 			return
 		}
-		record, createErr := checkout.CreateLinkForRecipient(ctx, s.vault, s.accounts, checkout.LinkRequest{
+		record, createErr := checkout.CreateLinkForRecipient(ctx, s.records, s.accounts, checkout.LinkRequest{
 			User:      user,
 			Recipient: recipient,
 			Months:    c.Months,
@@ -350,7 +350,7 @@ func (s *server) checkLink(codeID, user, recipient string) {
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 35*time.Second)
 	defer cancel()
-	record, err := checkout.CheckLink(ctx, s.vault, s.accounts, recipient)
+	record, err := checkout.CheckLink(ctx, s.records, s.accounts, recipient)
 	s.applyLinkState(codeID, user, record, err)
 }
 
@@ -399,7 +399,7 @@ func (s *server) reconcileLoop() {
 		ctx, cancel := context.WithTimeout(s.ctx, 12*time.Second)
 		select {
 		case s.work <- struct{}{}:
-			record, checkErr := checkout.CheckLink(ctx, s.vault, s.accounts, recipient)
+			record, checkErr := checkout.CheckLink(ctx, s.records, s.accounts, recipient)
 			s.applyLinkState(id, user, record, checkErr)
 			<-s.work
 		default:
@@ -449,7 +449,7 @@ func (s *server) manualLink(w http.ResponseWriter, r *http.Request) {
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	ctx, cancel := context.WithTimeout(r.Context(), 170*time.Second)
 	defer cancel()
-	record, err := checkout.CreateAdminLink(ctx, s.vault, s.accounts, q.Username, q.Months)
+	record, err := checkout.CreateAdminLink(ctx, s.records, s.accounts, q.Username, q.Months)
 	if err != nil {
 		log.Printf("manual link failed: username=%s months=%d reason=%s", q.Username, q.Months, manualLinkFailureReason(err))
 		switch {

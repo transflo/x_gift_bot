@@ -12,7 +12,7 @@ import (
 )
 
 func (s *server) listAccounts(w http.ResponseWriter, r *http.Request) {
-	list, err := accounts.Load(s.vault)
+	list, err := accounts.Load(s.records)
 	if err != nil {
 		// An unconfigured pool is reported as an empty list, not an error, so
 		// the admin UI can bootstrap it.
@@ -35,14 +35,14 @@ func (s *server) listAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	records := map[string]bool{}
-	if _, err := s.vault.Get("api-auth"); err == nil {
+	if _, err := s.records.Get("api-auth"); err == nil {
 		records["api_auth"] = true
 	}
-	if key, err := s.vault.Get("stripe-key"); err == nil {
+	if key, err := s.records.Get("stripe-key"); err == nil {
 		clear(key)
 		records["stripe_key"] = true
 	}
-	if _, err := checkout.ReadCatalog(s.vault); err == nil {
+	if _, err := checkout.ReadCatalog(s.records); err == nil {
 		records["catalog"] = true
 	}
 	reply(w, 200, map[string]any{"accounts": sanitized, "enabled": enabled, "records": records})
@@ -68,7 +68,7 @@ func (s *server) saveAccount(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
-	list, err := accounts.Load(s.vault)
+	list, err := accounts.Load(s.records)
 	if err != nil {
 		if !strings.Contains(err.Error(), "missing") {
 			message(w, 503, "账号池读取失败，请检查加密记录。")
@@ -118,7 +118,7 @@ func (s *server) saveAccount(w http.ResponseWriter, r *http.Request) {
 		}
 		list = append(list, account)
 	}
-	if err = accounts.Save(s.vault, list); err != nil {
+	if err = accounts.Save(s.records, list); err != nil {
 		message(w, 503, "账号保存失败，请稍后重试。")
 		return
 	}
@@ -132,7 +132,7 @@ func (s *server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
-	list, err := accounts.Load(s.vault)
+	list, err := accounts.Load(s.records)
 	if err != nil {
 		message(w, 503, "账号池读取失败。")
 		return
@@ -154,7 +154,7 @@ func (s *server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		message(w, 409, "至少需要保留一个账号；请先添加新账号再删除。")
 		return
 	}
-	if err = accounts.Save(s.vault, next); err != nil {
+	if err = accounts.Save(s.records, next); err != nil {
 		message(w, 503, "删除失败，请稍后重试。")
 		return
 	}
@@ -169,7 +169,7 @@ func (s *server) toggleAccount(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
-	list, err := accounts.Load(s.vault)
+	list, err := accounts.Load(s.records)
 	if err != nil {
 		message(w, 503, "账号池读取失败。")
 		return
@@ -186,7 +186,7 @@ func (s *server) toggleAccount(w http.ResponseWriter, r *http.Request) {
 		message(w, 404, "账号不存在。")
 		return
 	}
-	if err = accounts.Save(s.vault, list); err != nil {
+	if err = accounts.Save(s.records, list); err != nil {
 		message(w, 503, "保存失败，请稍后重试。")
 		return
 	}
@@ -200,7 +200,7 @@ func (s *server) testAccount(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
-	list, err := accounts.Load(s.vault)
+	list, err := accounts.Load(s.records)
 	if err != nil {
 		message(w, 503, "账号池读取失败。")
 		return
@@ -217,7 +217,7 @@ func (s *server) testAccount(w http.ResponseWriter, r *http.Request) {
 		message(w, 404, "账号不存在。")
 		return
 	}
-	if _, err = s.vault.Get("api-auth"); err != nil {
+	if _, err = s.records.Get("api-auth"); err != nil {
 		message(w, 409, "X API 授权记录缺失，请先运行配置向导。")
 		return
 	}

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 // Health is what the pool knows about an account without asking X: the outcome
@@ -101,7 +101,7 @@ func (m *Manager) Probe(ctx context.Context, a Account) error {
 
 // Watch probes every enabled account on an interval until ctx is done, so a
 // proxy that dies between checkouts is noticed before a customer hits it.
-func (m *Manager) Watch(ctx context.Context, v *vault.Vault, every time.Duration) {
+func (m *Manager) Watch(ctx context.Context, v *store.Store, every time.Duration) {
 	if every <= 0 {
 		return
 	}
@@ -117,7 +117,7 @@ func (m *Manager) Watch(ctx context.Context, v *vault.Vault, every time.Duration
 	}
 }
 
-func (m *Manager) probeAll(ctx context.Context, v *vault.Vault) {
+func (m *Manager) probeAll(ctx context.Context, v *store.Store) {
 	list, err := Load(v)
 	if err != nil {
 		return

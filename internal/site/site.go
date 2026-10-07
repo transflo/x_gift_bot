@@ -29,7 +29,7 @@ import (
 	"xgift/internal/accounts"
 	"xgift/internal/checkout"
 	"xgift/internal/oplog"
-	"xgift/internal/vault"
+	"xgift/internal/store"
 )
 
 //go:embed all:web
@@ -48,7 +48,7 @@ type server struct {
 	turnstileSecret  string
 	turnstileHTTP    *http.Client
 	db               *sql.DB
-	vault            *vault.Vault
+	records            *store.Store
 	accounts         *accounts.Manager
 	logs             *oplog.Log
 	origin           string
@@ -191,11 +191,11 @@ func Run(ctx context.Context) error {
 	if err = s.configureTurnstile(); err != nil {
 		return err
 	}
-	v, err := openVault(dir)
+	v, err := store.Open(filepath.Join(dir, "records.db"))
 	if err != nil {
 		return err
 	}
-	s.vault = v
+	s.records = v
 	defer v.Close()
 	if err = seedDefaults(v); err != nil {
 		return err
@@ -263,7 +263,6 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("GET "+api+"stats", s.admin(s.stats))
 	mux.HandleFunc("GET "+api+"customer", s.admin(s.customerOrder))
 	mux.HandleFunc("GET "+api+"accounts", s.admin(s.listAccounts))
-	mux.HandleFunc("GET "+api+"vault", s.admin(s.vaultBackup))
 	mux.HandleFunc("GET "+api+"settings", s.admin(s.readSettings))
 	mux.HandleFunc("POST "+api+"settings/stripe-key", s.admin(s.saveStripeKey))
 	mux.HandleFunc("POST "+api+"settings/announcement", s.admin(s.saveAnnouncement))
@@ -525,7 +524,17 @@ func (s *server) middleware(next http.Handler) http.Handler {
 			message(recorded, 403, "请求来源不正确，请从本站页面重试。")
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/admin") {
+		// The admin API hangs off the per-install segment, so "/api/" never
+		// covers it. Without this branch the panel's own login endpoint is the
+		// one interface that can be guessed-and-tried without a rate limit.
+		adminAPI := "/" + s.adminPath + "/api/admin/"
+		if strings.HasPrefix(r.URL.Path, adminAPI) {
+			if !s.allow("admin:"+ip, 60) {
+				recorded.Header().Set("Retry-After", "60")
+				message(recorded, 429, "操作太频繁，请稍后重试。")
+				return
+			}
+		} else if strings.HasPrefix(r.URL.Path, "/api/") {
 			max := 60
 			bucket := "api:"
 			if r.URL.Path == "/api/redeem" {
@@ -722,7 +731,7 @@ func (s *server) check(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	_, err := checkout.Eligibility(ctx, s.vault, s.accounts, q.Username)
+	_, err := checkout.Eligibility(ctx, s.records, s.accounts, q.Username)
 	if err != nil {
 		switch {
 		case errors.Is(err, checkout.ErrNotEligible):
@@ -775,11 +784,10 @@ func (s *server) generate(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < q.Count; i++ {
 		code := "XG-" + strings.ToUpper(token(24))
 		id := token(16)
-		// Persist the encrypted content first; an interrupted transaction can
-		// only leave an unreachable vault record, never an active code without
-		// its encrypted value.
-		if e = s.vault.Put("redemption:"+id, []byte(code)); e != nil {
-			message(w, 503, "无法加密保存兑换码，尚未生成本批。")
+		// Persist the content first; an interrupted transaction can only leave
+		// an unreachable record, never an active code without its value.
+		if e = s.records.Put("redemption:"+id, []byte(code)); e != nil {
+			message(w, 503, "无法保存兑换码，尚未生成本批。")
 			return
 		}
 		_, e = tx.Exec("INSERT INTO codes(id,hash,hint,batch,months,status,created,updated,folder_id,copyable) VALUES(?,?,?,?,?,'active',?,?,?,1)", id, hash(code), code[len(code)-8:], q.Batch, q.Months, now, now, folder)
@@ -817,7 +825,7 @@ func (s *server) revoke(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) manualLinkPlans(w http.ResponseWriter, r *http.Request) {
-	cat, err := checkout.ReadCatalog(s.vault)
+	cat, err := checkout.ReadCatalog(s.records)
 	if err != nil {
 		message(w, 503, "套餐配置暂不可用。")
 		return
